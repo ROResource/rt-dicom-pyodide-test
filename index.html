@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RT DICOM Pyodide test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font-family:system-ui,sans-serif;background:#111;color:#ddd;margin:16px}
+  #wrap{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+  canvas{background:#000;max-width:100%;image-rendering:pixelated}
+  #rois{font-size:13px;max-height:80vh;overflow:auto}
+  .sw{display:inline-block;width:10px;height:10px;margin-right:6px}
+  pre{font-size:12px;white-space:pre-wrap;color:#9c9}
+  label{margin-right:12px}
+</style>
+</head>
+<body>
+<h3>RT DICOM test (Pyodide + pydicom, files stay on this computer)</h3>
+<p>
+  <label>CT folder: <input type="file" id="ctDir" webkitdirectory multiple></label>
+  <label>or CT files: <input type="file" id="ctFiles" multiple></label>
+  <label>RTSTRUCT: <input type="file" id="rs"></label>
+  <button id="go" disabled>Load</button>
+</p>
+<p>
+  Slice <input type="range" id="slice" min="0" max="0" value="0" style="width:300px"> <span id="sl"></span>
+  &nbsp; W/L: <select id="wl">
+    <option value="400,40">Soft tissue 400/40</option>
+    <option value="1600,-600">Lung 1600/-600</option>
+    <option value="2000,300">Bone 2000/300</option>
+  </select>
+</p>
+<pre id="log">Loading Pyodide…</pre>
+<div id="wrap"><canvas id="cv"></canvas><div id="rois"></div></div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.29.0/full/pyodide.js"></script>
+<script>
+const log = m => { document.getElementById('log').textContent += '\n' + m; };
+let py, meta = null, rois = [], cur = 0;
+
+const PY = String.raw`
+import os, json, numpy as np, pydicom
+
+def load(ct_dir, rs_path):
+    global vol, slices, info
+    ds_list, skipped = [], 0
+    for f in os.listdir(ct_dir):
+        try:
+            d = pydicom.dcmread(os.path.join(ct_dir, f), force=True)
+            if getattr(d, 'Modality', '') == 'CT' and 'PixelData' in d:
+                ds_list.append(d)
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
+    if not ds_list:
+        raise ValueError('No CT images with pixel data found')
+    iop = np.array(ds_list[0].ImageOrientationPatient, float)
+    row, col = iop[:3], iop[3:]
+    normal = np.cross(row, col)
+    ds_list.sort(key=lambda d: float(np.dot(normal, np.array(d.ImagePositionPatient, float))))
+    slices = ds_list
+    vol = np.stack([d.pixel_array.astype(np.float32) * float(getattr(d,'RescaleSlope',1)) + float(getattr(d,'RescaleIntercept',0)) for d in ds_list])
+    d0 = ds_list[0]
+    ps = [float(x) for x in d0.PixelSpacing]  # [row spacing, col spacing]
+    pos = [float(np.dot(normal, np.array(d.ImagePositionPatient, float))) for d in ds_list]
+    uid_to_idx = {d.SOPInstanceUID: i for i, d in enumerate(ds_list)}
+    info = dict(n=len(ds_list), rows=int(d0.Rows), cols=int(d0.Columns), ps=ps,
+                patient=str(getattr(d0,'PatientID','')), series=str(getattr(d0,'SeriesDescription','')),
+                skipped=skipped, sliceGap=float(np.median(np.diff(pos))) if len(pos) > 1 else 0,
+                hu=[float(vol.min()), float(vol.max())])
+
+    out = []
+    if rs_path:
+        rs = pydicom.dcmread(rs_path, force=True)
+        names = {r.ROINumber: r.ROIName for r in rs.StructureSetROISequence}
+        tol = abs(info['sliceGap']) / 2 if info['sliceGap'] else 1.0
+        posarr = np.array(pos)
+        unmatched = 0
+        for rc in getattr(rs, 'ROIContourSequence', []):
+            num = rc.ReferencedROINumber
+            color = [int(c) for c in getattr(rc, 'ROIDisplayColor', [255, 255, 0])]
+            per_slice, npts = {}, 0
+            for c in getattr(rc, 'ContourSequence', []):
+                pts = np.array(c.ContourData, float).reshape(-1, 3)
+                npts += len(pts)
+                idx = None
+                if 'ContourImageSequence' in c and len(c.ContourImageSequence):
+                    idx = uid_to_idx.get(c.ContourImageSequence[0].ReferencedSOPInstanceUID)
+                if idx is None:
+                    z = float(np.dot(normal, pts[0]))
+                    j = int(np.argmin(np.abs(posarr - z)))
+                    if abs(posarr[j] - z) <= tol + 1e-3:
+                        idx = j
+                if idx is None:
+                    unmatched += 1
+                    continue
+                ipp = np.array(slices[idx].ImagePositionPatient, float)
+                rel = pts - ipp
+                x = rel @ row / ps[1]   # column index
+                y = rel @ col / ps[0]   # row index
+                per_slice.setdefault(idx, []).append(np.column_stack([x, y]).ravel().round(2).tolist())
+            out.append(dict(name=str(names.get(num, f'ROI {num}')), color=color,
+                            nContours=sum(len(v) for v in per_slice.values()), nPoints=npts, slices=per_slice))
+        info['unmatchedContours'] = unmatched
+    return json.dumps(dict(info=info, rois=out))
+
+def slice_rgba(i, ww, wl):
+    a = vol[int(i)]
+    lo = wl - ww / 2
+    g = np.clip((a - lo) / ww * 255, 0, 255).astype(np.uint8)
+    rgba = np.empty(g.shape + (4,), np.uint8)
+    rgba[..., 0] = g; rgba[..., 1] = g; rgba[..., 2] = g; rgba[..., 3] = 255
+    return rgba.tobytes()
+`;
+
+(async () => {
+  try {
+    py = await loadPyodide();
+    log('Pyodide ' + py.version + ' loaded. Installing numpy + pydicom…');
+    await py.loadPackage(['numpy', 'micropip']);
+    await py.runPythonAsync("import micropip\nawait micropip.install('pydicom')");
+    await py.runPythonAsync(PY);
+    log('pydicom ' + py.runPython('pydicom.__version__') + ' ready. Choose CT + RTSTRUCT, then Load.');
+    document.getElementById('go').disabled = false;
+  } catch (e) { log('ERROR: ' + e); }
+})();
+
+async function writeFiles(files, dir) {
+  py.FS.mkdirTree(dir);
+  let i = 0;
+  for (const f of files) {
+    py.FS.writeFile(`${dir}/f${i++}`, new Uint8Array(await f.arrayBuffer()));
+  }
+  return i;
+}
+
+document.getElementById('go').onclick = async () => {
+  try {
+    const ctFiles = [...document.getElementById('ctDir').files, ...document.getElementById('ctFiles').files];
+    const rsFile = document.getElementById('rs').files[0];
+    if (!ctFiles.length) return log('Pick CT files first.');
+    const dir = '/data/ct' + Date.now();
+    log(`Copying ${await writeFiles(ctFiles, dir)} CT files into Pyodide…`);
+    let rsPath = '';
+    if (rsFile) { rsPath = '/data/rs' + Date.now(); py.FS.writeFile(rsPath, new Uint8Array(await rsFile.arrayBuffer())); }
+    log('Parsing with pydicom…');
+    const t = performance.now();
+    const res = JSON.parse(py.globals.get('load')(dir, rsPath));
+    meta = res.info; rois = res.rois;
+    log(`Parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(meta));
+    const cv = document.getElementById('cv');
+    cv.width = meta.cols; cv.height = meta.rows;
+    // physical aspect ratio
+    cv.style.width = 'min(90vw, 640px)'; cv.style.aspectRatio = (meta.cols * meta.ps[1]) + ' / ' + (meta.rows * meta.ps[0]);
+    const s = document.getElementById('slice');
+    s.max = meta.n - 1; cur = Math.floor(meta.n / 2); s.value = cur;
+    document.getElementById('rois').innerHTML = '<b>' + rois.length + ' structures</b><br>' + rois.map(r =>
+      `<div><span class="sw" style="background:rgb(${r.color})"></span>${r.name} <small>(${r.nContours} contours, ${r.nPoints} pts)</small></div>`).join('');
+    draw();
+  } catch (e) { log('ERROR: ' + e); console.error(e); }
+};
+
+function draw() {
+  if (!meta) return;
+  const [ww, wl] = document.getElementById('wl').value.split(',').map(Number);
+  const proxy = py.globals.get('slice_rgba')(cur, ww, wl);
+  const buf = proxy.toJs(); proxy.destroy();
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(buf.buffer, buf.byteOffset, buf.length), meta.cols, meta.rows), 0, 0);
+  ctx.lineWidth = 1;
+  for (const r of rois) {
+    const cs = r.slices[cur]; if (!cs) continue;
+    ctx.strokeStyle = `rgb(${r.color})`;
+    for (const c of cs) {
+      ctx.beginPath(); ctx.moveTo(c[0], c[1]);
+      for (let k = 2; k < c.length; k += 2) ctx.lineTo(c[k], c[k+1]);
+      ctx.closePath(); ctx.stroke();
+    }
+  }
+  document.getElementById('sl').textContent = `${cur + 1} / ${meta.n}`;
+}
+
+document.getElementById('slice').oninput = e => { cur = +e.target.value; draw(); };
+document.getElementById('wl').onchange = draw;
+document.getElementById('cv').addEventListener('wheel', e => {
+  e.preventDefault(); if (!meta) return;
+  cur = Math.max(0, Math.min(meta.n - 1, cur + (e.deltaY > 0 ? 1 : -1)));
+  document.getElementById('slice').value = cur; draw();
+}, {passive: false});
+</script>
+</body>
+</html>
