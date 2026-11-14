@@ -61,7 +61,7 @@ P = None; S = None; sec_cache = {}
 NON_IMAGE = {'RTSTRUCT', 'REG', 'RTPLAN', 'RTDOSE', 'RTRECORD', 'SR', 'PR', 'KO'}
 
 ING, OTHER, FACTOR = {}, {}, {}
-VOXEL_BUDGET = 60_000_000      # max secondary voxels kept in memory (~240 MB float32)
+VOXEL_BUDGET = 80_000_000      # max secondary voxels kept in memory (~320 MB float32)
 
 def ingest_begin(tag, nfiles, downsample):
     """Start streaming a series in. Files are read one at a time and deleted immediately."""
@@ -97,7 +97,10 @@ def ingest(tag, path):
     arr = d.pixel_array
     if arr.ndim != 2:
         return 'multiframe-skipped'
-    arr = arr.astype(np.float32) * float(getattr(d, 'RescaleSlope', 1) or 1) + float(getattr(d, 'RescaleIntercept', 0) or 0)
+    slope = float(getattr(d, 'RescaleSlope', 1) or 1); icpt = float(getattr(d, 'RescaleIntercept', 0) or 0)
+    arr = arr.astype(np.float32) * slope + icpt
+    if f == 1 and slope.is_integer() and icpt.is_integer() and arr.min() >= -32768 and arr.max() <= 32767:
+        arr = arr.astype(np.int16)        # e.g. CT HU: half the memory of float32
     if f > 1:
         r, c = (arr.shape[0] // f) * f, (arr.shape[1] // f) * f
         arr = arr[:r, :c].reshape(r // f, f, c // f, f).mean(axis=(1, 3), dtype=np.float32)
@@ -119,13 +122,14 @@ def build_series(tag):
     items = None
     sel = max(groups.values(), key=len)
     nseries = len(groups); groups = None; gc.collect()
-    d0 = sel[0][0]
-    iop = np.array(d0.ImageOrientationPatient, float)
+    iop = np.array(sel[0][0].ImageOrientationPatient, float)
     row, col = iop[:3], iop[3:]
     normal = np.cross(row, col)
     sel.sort(key=lambda t: float(np.dot(normal, np.array(t[0].ImagePositionPatient, float))))
     sl = [t[0] for t in sel]
-    vol = np.empty((len(sel),) + sel[0][1].shape, np.float32)
+    d0 = sl[0]             # first slice AFTER sorting (files arrive in arbitrary order)
+    dtype = np.int16 if all(t[1].dtype == np.int16 for t in sel) else np.float32
+    vol = np.empty((len(sel),) + sel[0][1].shape, dtype)
     for i in range(len(sel)):
         vol[i] = sel[i][1]; sel[i] = None
     sel = None; gc.collect()
