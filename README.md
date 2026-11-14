@@ -11,3 +11,6 @@ Axial / sagittal / coronal reconstructions on the primary grid (A/S/C keys); cli
 ## Multiple scans + crop
 Up to 4 extra scans (5 total). Every loaded REG is added to a frame-of-reference graph, so a scan can be registered to the CT directly or to another loaded scan (e.g. MR2 -> MR1 -> CT); status shows the path or flags it as unregistered. Secondaries are stored float16 to fit several in memory, and uneven slice spacing is handled using each slice's own position.
 Crop (applies to every scan and plane): Auto (body, couch excluded; applied on load), to visible structures + margin, or drag a box on any plane. Reset restores the full grid.
+
+## Scan names + notes
+Every scan has an editable display name (used in the viewer and, later, the PDF). Notes: "+ Add note", click the point, then click where the text box goes, and type. Each note belongs to one scan + plane + slice. Drag the box header or the dot to reposition; positions are stored in image coordinates so they stay put when cropping or resizing. The notes list jumps to any note.

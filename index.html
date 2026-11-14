@@ -24,11 +24,27 @@
   input[type=number]{width:60px}
   button{margin-right:4px}
   .bar{margin:6px 0}
+  .scanName{width:170px;background:#222;color:#ddd;border:1px solid #444}
+  #stage{position:relative;line-height:0}
+  #notesLayer{position:absolute;left:0;top:0;pointer-events:none;line-height:normal}
+  canvas.placing{cursor:copy}
+  .note{position:absolute;pointer-events:auto;background:rgba(10,10,10,.82);border:1.5px solid #ffd400;border-radius:4px;width:190px;font-size:12px}
+  .note .nh{display:flex;justify-content:space-between;background:#ffd400;color:#111;font-size:11px;padding:0 4px;cursor:move;user-select:none}
+  .note .nh .del{cursor:pointer;font-weight:bold;padding:0 2px}
+  .note textarea{width:100%;box-sizing:border-box;background:transparent;color:#fff;border:0;resize:horizontal;font:12px/1.35 system-ui;padding:3px 5px;overflow:hidden;min-height:22px}
+  .note textarea:focus{outline:none}
+  #side{display:flex;flex-direction:column;gap:12px;min-width:320px}
+  #notesPanel{font-size:13px}
+  #notesPanel .nl{max-height:22vh;overflow:auto;margin-top:4px}
+  #notesPanel .ni{padding:2px 4px;cursor:pointer;border-left:3px solid transparent}
+  #notesPanel .ni:hover{background:#222}
+  #notesPanel .ni.here{border-left-color:#ffd400}
+  #addNote.on{background:#ffd400;color:#111}
 </style>
 </head>
 <body>
 <h3>RT DICOM test (Pyodide + pydicom, files stay on this computer)</h3>
-<fieldset><legend>Primary (CT)</legend>
+<fieldset><legend>Primary (CT) &nbsp; <label>Display name <input type="text" id="name_pri" class="scanName" value="CT"></label></legend>
   <label>CT folder: <input type="file" id="ctDir" webkitdirectory multiple></label>
   <label>or CT files: <input type="file" id="ctFiles" multiple></label>
   <label>RTSTRUCT: <input type="file" id="rs"></label>
@@ -64,8 +80,11 @@
 </div>
 <pre id="log">Loading Pyodide…</pre>
 <div id="wrap">
-  <canvas id="cv"></canvas>
-  <div id="rois"></div>
+  <div id="stage"><canvas id="cv"></canvas><div id="notesLayer"></div></div>
+  <div id="side">
+    <div id="notesPanel"></div>
+    <div id="rois"></div>
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
@@ -456,6 +475,8 @@ let crop = null;                        // {c0,c1,r0,r1,k0,k1} inclusive, primar
 let lineWidth = 1.5, current = 'pri';
 const off = document.createElement('canvas');   // native-resolution plane image
 const SLOT_IDS = ['s1', 's2', 's3', 's4'];
+let priName = 'CT';
+const scanName = id => id === 'pri' ? (priName || 'CT') : (secs[id] && secs[id].label) || id;
 const secs = {};                         // id -> {shown, loaded, label, ww, wl, status}
 
 (async () => {
@@ -512,6 +533,7 @@ $('go').onclick = async () => {
     log(`Primary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(meta));
     pos = {k: Math.floor(meta.n / 2), r: Math.floor(meta.rows / 2), c: Math.floor(meta.cols / 2)};
     crop = null; current = 'pri';
+    notes = []; pruneNoteEls(); noteMode = null; renderNotesPanel();
     initSlots();
     buildRoiPanel();
     ['cropAuto', 'cropDraw', 'cropReset', 'addSec'].forEach(id => $(id).disabled = false);
@@ -523,7 +545,7 @@ $('go').onclick = async () => {
 // ---------- secondary slots ----------
 function initSlots() {
   $('secSlots').innerHTML = SLOT_IDS.map((id, n) => `
-    <fieldset class="sec" id="slot_${id}" style="display:none"><legend>Scan ${n + 2} <b id="lab_${id}"></b></legend>
+    <fieldset class="sec" id="slot_${id}" style="display:none"><legend>Scan ${n + 2} <b id="lab_${id}"></b> &nbsp; <label id="nmw_${id}" style="display:none">Display name <input type="text" id="name_${id}" class="scanName"></label></legend>
       <label>Image folder: <input type="file" id="dir_${id}" webkitdirectory multiple></label>
       <label>or files: <input type="file" id="files_${id}" multiple></label>
       <label>REG file: <input type="file" id="reg_${id}"></label>
@@ -535,6 +557,7 @@ function initSlots() {
     secs[id] = {shown: false, loaded: false, label: '', ww: 0, wl: 0, status: ''};
     $('load_' + id).onclick = () => loadSecondary(id);
     $('rm_' + id).onclick = () => removeSecondary(id);
+    $('name_' + id).oninput = e => { secs[id].label = e.target.value; buildImgSel(); draw(); renderNotesPanel(); };
     $('inv_' + id).onchange = e => { if (secs[id].loaded) applyResolve(JSON.parse(py.globals.get('set_invert')(id, e.target.checked))); };
   });
   showSlot('s1');
@@ -556,7 +579,8 @@ async function loadSecondary(id) {
     const info = res.info;
     log(`${id} parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(info));
     Object.assign(secs[id], {loaded: true, label: info.series || info.modality, ww: info.autoW, wl: info.autoL});
-    $('lab_' + id).textContent = `${info.modality} · ${secs[id].label}`;
+    $('lab_' + id).textContent = `${info.modality} · ${info.series || ''}`;
+    $('name_' + id).value = secs[id].label; $('nmw_' + id).style.display = '';
     applyResolve(res.all);
     current = id; buildImgSel(); draw();
   } catch (e) { log('ERROR: ' + e); console.error(e); }
@@ -564,7 +588,10 @@ async function loadSecondary(id) {
 function removeSecondary(id) {
   if (secs[id].loaded) applyResolve(JSON.parse(py.globals.get('remove_secondary')(id)));
   Object.assign(secs[id], {loaded: false, label: '', status: ''});
-  $('lab_' + id).textContent = ''; $('st_' + id).textContent = '';
+  $('lab_' + id).textContent = ''; $('st_' + id).textContent = ''; $('nmw_' + id).style.display = 'none';
+  const nn = notes.length; notes = notes.filter(n => n.scan !== id);
+  if (nn !== notes.length) log(`Removed ${nn - notes.length} note(s) that belonged to that scan.`);
+  pruneNoteEls(); renderNotesPanel();
   ['dir_', 'files_', 'reg_'].forEach(p => $(p + id).value = '');
   if (id !== 's1') { secs[id].shown = false; $('slot_' + id).style.display = 'none'; $('addSec').disabled = false; }
   if (current === id) current = 'pri';
@@ -585,10 +612,10 @@ function applyResolve(all) {
 }
 function loadedIds() { return SLOT_IDS.filter(i => secs[i].loaded); }
 function buildImgSel() {
-  const opts = [['pri', 'CT'], ...loadedIds().map(i => [i, secs[i].label + (secs[i].status === 'UNREGISTERED' ? ' ⚠' : '')])];
+  const opts = [['pri', scanName('pri')], ...loadedIds().map(i => [i, scanName(i) + (secs[i].status === 'UNREGISTERED' ? ' ⚠' : '')])];
   $('imgSel').innerHTML = opts.map(([v, l], n) =>
     `<label><input type="radio" name="img" value="${v}" ${v === current ? 'checked' : ''}> ${n + 1}: ${esc(l)}</label>`).join('');
-  document.querySelectorAll('input[name=img]').forEach(r => r.onchange = e => { current = e.target.value; syncWL(); draw(); });
+  document.querySelectorAll('input[name=img]').forEach(r => r.onchange = e => { current = e.target.value; syncWL(); draw(); renderNotesPanel(); });
   syncWL();
 }
 function syncWL() {
@@ -599,7 +626,146 @@ function syncWL() {
 }
 $('sw').oninput = () => { if (secs[current]) { secs[current].ww = +$('sw').value; draw(); } };
 $('sl2').oninput = () => { if (secs[current]) { secs[current].wl = +$('sl2').value; draw(); } };
-function selectImage(v) { current = v; buildImgSel(); draw(); }
+function selectImage(v) { current = v; buildImgSel(); draw(); renderNotesPanel(); }
+
+$('name_pri').oninput = e => { priName = e.target.value; buildImgSel(); draw(); renderNotesPanel(); };
+
+// ---------- notes (scan + plane + slice specific; positions stored in native plane pixels) ----------
+let notes = [], noteSeq = 1, noteMode = null, pending = null, suppressClick = false;
+let view2css = null;                    // {g, kx, ky}: native px -> css px for the current draw
+const noteEls = new Map();              // note id -> DOM element
+const PLANE_NAME = {ax: 'Axial', sag: 'Sagittal', cor: 'Coronal'};
+const curWhich = () => secs[current] && secs[current].loaded ? current : 'pri';
+
+function toNativeF(e) {                 // continuous native-plane coords (pixel-edge based)
+  const g = planeGeom(radio('plane')), rect = $('cv').getBoundingClientRect();
+  return {x: g.x0 + (e.clientX - rect.left) / rect.width * g.cw, y: g.y0 + (e.clientY - rect.top) / rect.height * g.ch};
+}
+function setNoteMode(on) {
+  noteMode = on ? 'anchor' : null;
+  $('addNote').classList.toggle('on', on);
+  $('addNote').textContent = on ? 'Click the point on the image…' : '+ Add note';
+  $('cv').classList.toggle('placing', on);
+}
+function cancelNote() {
+  if (pending) { notes = notes.filter(n => n !== pending); pending = null; pruneNoteEls(); }
+  setNoteMode(false); draw(); renderNotesPanel();
+}
+// returns true if the click was consumed by note placement
+function noteClick(e) {
+  if (noteMode === 'anchor') {
+    const a = toNativeF(e), p = radio('plane'), g = planeGeom(p);
+    pending = {id: noteSeq++, scan: curWhich(), plane: p, idx: g.idx, anchor: a,
+               box: {x: a.x + g.cw * 0.08, y: a.y - g.ch * 0.08}, text: ''};
+    notes.push(pending); noteMode = 'box';
+    $('addNote').textContent = 'Now click where the text box goes…';
+    draw(); return true;
+  }
+  if (noteMode === 'box') {
+    pending.box = toNativeF(e);
+    const n = pending; pending = null; setNoteMode(false); draw(); renderNotesPanel();
+    const el = noteEls.get(n.id); if (el) el.querySelector('textarea').focus();
+    return true;
+  }
+  return false;
+}
+function noteEl(n) {
+  let el = noteEls.get(n.id);
+  if (el) return el;
+  el = document.createElement('div'); el.className = 'note';
+  el.innerHTML = '<div class="nh"><span class="drag" title="Drag to move">⠿ move</span><span class="del" title="Delete note">×</span></div><textarea rows="1" placeholder="Type note…"></textarea>';
+  const ta = el.querySelector('textarea');
+  ta.value = n.text;
+  const fit = () => { const h0 = ta.style.height; ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; if (ta.style.height !== h0) draw(); };
+  ta.oninput = () => { n.text = ta.value; fit(); renderNotesPanel(); };
+  new ResizeObserver(() => { if (!dragNote) draw(); }).observe(ta);
+  el.querySelector('.del').onclick = () => { notes = notes.filter(x => x !== n); if (pending === n) { pending = null; setNoteMode(false); } pruneNoteEls(); draw(); renderNotesPanel(); };
+  el.querySelector('.nh').addEventListener('mousedown', e => {
+    if (e.target.classList.contains('del')) return;
+    e.preventDefault(); dragNote = {n, what: 'box', x: e.clientX, y: e.clientY, bx: n.box.x, by: n.box.y};
+  });
+  $('notesLayer').appendChild(el); noteEls.set(n.id, el);
+  requestAnimationFrame(fit);
+  return el;
+}
+function pruneNoteEls() {
+  const ids = new Set(notes.map(n => n.id));
+  for (const [id, el] of noteEls) if (!ids.has(id)) { el.remove(); noteEls.delete(id); }
+}
+function renderNotes(p, g, which, ctx, cssW, cssH, dpr) {
+  const layer = $('notesLayer');
+  layer.style.width = cssW + 'px'; layer.style.height = cssH + 'px';
+  const kx = cssW / g.cw, ky = cssH / g.ch;
+  view2css = {g, kx, ky};
+  const here = notes.filter(n => n.scan === which && n.plane === p && n.idx === g.idx);
+  for (const n of notes) { const el = noteEls.get(n.id); if (el && !here.includes(n)) el.style.display = 'none'; }
+  for (const n of here) {
+    const el = noteEl(n);
+    el.style.display = '';
+    el.style.pointerEvents = n === pending ? 'none' : '';   // let clicks reach the canvas while placing
+    el.style.left = ((n.box.x - g.x0) * kx) + 'px'; el.style.top = ((n.box.y - g.y0) * ky) + 'px';
+    // leader line: anchor -> nearest point of the box
+    const ax = (n.anchor.x - g.x0) * kx, ay = (n.anchor.y - g.y0) * ky;
+    let l = el.offsetLeft, t = el.offsetTop; const w = el.offsetWidth, h = el.offsetHeight;
+    // keep the box inside the image
+    const lc = Math.max(0, Math.min(cssW - w, l)), tc = Math.max(0, Math.min(cssH - h, t));
+    if (lc !== l || tc !== t) {
+      l = lc; t = tc; el.style.left = l + 'px'; el.style.top = t + 'px';
+      if (!dragNote || dragNote.n !== n) n.box = {x: g.x0 + l / kx, y: g.y0 + t / ky};
+    }
+    const px = Math.max(l, Math.min(l + w, ax)), py = Math.max(t, Math.min(t + h, ay));
+    ctx.save();
+    ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 1.5 * dpr;
+    ctx.beginPath(); ctx.moveTo(ax * dpr, ay * dpr); ctx.lineTo(px * dpr, py * dpr); ctx.stroke();
+    ctx.fillStyle = '#ffd400'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1 * dpr;
+    ctx.beginPath(); ctx.arc(ax * dpr, ay * dpr, 4 * dpr, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+}
+function renderNotesPanel() {
+  const el = $('notesPanel'); if (!el) return;
+  if (!meta) { el.innerHTML = ''; return; }
+  const p = radio('plane'), g = planeGeom(p), which = curWhich();
+  const sorted = [...notes].sort((a, b) => (a.scan + a.plane).localeCompare(b.scan + b.plane) || a.idx - b.idx);
+  const nHere = notes.filter(n => n.scan === which && n.plane === p && n.idx === g.idx).length;
+  el.innerHTML = `<b>Notes</b> <small>(${notes.length} total, ${nHere} on this slice)</small><br>
+    <button id="addNote">+ Add note</button> <small>Esc cancels. Drag a dot or a box header to move it.</small>
+    <div class="nl">${sorted.map(n => {
+      const isHere = n.scan === which && n.plane === p && n.idx === g.idx;
+      return `<div class="ni ${isHere ? 'here' : ''}" data-id="${n.id}">${esc(scanName(n.scan))} · ${PLANE_NAME[n.plane]} ${n.idx + 1}: <span style="color:#aaa">${esc((n.text || '(empty)').slice(0, 60))}</span></div>`;
+    }).join('')}</div>`;
+  $('addNote').onclick = () => { if (noteMode) cancelNote(); else setNoteMode(true); };
+  if (noteMode) { $('addNote').classList.add('on'); $('addNote').textContent = noteMode === 'anchor' ? 'Click the point on the image…' : 'Now click where the text box goes…'; }
+  el.querySelectorAll('.ni').forEach(d => d.onclick = () => jumpToNote(notes.find(n => n.id === +d.dataset.id)));
+}
+function jumpToNote(n) {
+  if (!n) return;
+  if (n.scan !== 'pri' && !(secs[n.scan] && secs[n.scan].loaded)) return;
+  current = n.scan; setRadio('plane', n.plane); setIdx(n.plane, n.idx);
+  const c = crop || fullCrop();
+  const inside = n.plane === 'ax' ? n.idx >= c.k0 && n.idx <= c.k1 : n.plane === 'sag' ? n.idx >= c.c0 && n.idx <= c.c1 : n.idx >= c.r0 && n.idx <= c.r1;
+  if (!inside) setCrop(fullCrop(), 'Full (note was outside crop)');
+  buildImgSel(); syncSlider(); draw(); renderNotesPanel();
+}
+// drag a note's box (header) or its anchor dot
+let dragNote = null;
+$('cv').addEventListener('mousedown', e => {
+  if (!meta || cropMode || noteMode || !view2css) return;
+  const rect = $('cv').getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const {g, kx, ky} = view2css, p = radio('plane'), which = curWhich();
+  const hit = notes.find(n => n.scan === which && n.plane === p && n.idx === g.idx &&
+    Math.hypot((n.anchor.x - g.x0) * kx - mx, (n.anchor.y - g.y0) * ky - my) < 8);
+  if (hit) { e.preventDefault(); dragNote = {n: hit, what: 'anchor'}; }
+});
+window.addEventListener('mousemove', e => {
+  if (noteMode === 'box' && pending && e.target === $('cv')) { pending.box = toNativeF(e); draw(); return; }
+  if (!dragNote || !view2css) return;
+  const {kx, ky} = view2css, d = dragNote;
+  if (d.what === 'box') d.n.box = {x: d.bx + (e.clientX - d.x) / kx, y: d.by + (e.clientY - d.y) / ky};
+  else d.n.anchor = toNativeF(e);
+  draw();
+});
+window.addEventListener('mouseup', () => { if (dragNote) { if (dragNote.what === 'anchor') suppressClick = true; dragNote = null; draw(); } });
 
 // ---------- structure panel ----------
 function buildRoiPanel() {
@@ -692,6 +858,7 @@ function planeGeom(p) {
 function setIdx(p, v) { if (p === 'ax') pos.k = v; else if (p === 'sag') pos.c = v; else pos.r = v; }
 function syncSlider() {
   if (!meta) return;
+  setTimeout(renderNotesPanel);
   const g = planeGeom(radio('plane'));
   $('slice').min = g.min; $('slice').max = g.max; $('slice').value = g.idx;
 }
@@ -788,9 +955,10 @@ function draw(overlay) {
                    (Math.abs(overlay.x1 - overlay.x0) + 1) * sx, (Math.abs(overlay.y1 - overlay.y0) + 1) * sy);
     ctx.restore();
   }
+  renderNotes(p, g, which, ctx, cssW, cssH, dpr);
   ctx.fillStyle = '#ff0'; ctx.font = `${12 * dpr}px system-ui`;
   const names = {ax: 'AXIAL', sag: 'SAGITTAL', cor: 'CORONAL'};
-  ctx.fillText(`${names[p]} · ${which === 'pri' ? 'CT (primary)' : secs[which].label + (secs[which].status === 'UNREGISTERED' ? ' — UNREGISTERED' : ' (registered)')}`, 6 * dpr, 16 * dpr);
+  ctx.fillText(`${names[p]} · ${scanName(which)}${which === 'pri' ? ' (primary)' : secs[which].status === 'UNREGISTERED' ? ' — UNREGISTERED' : ' (registered)'}`, 6 * dpr, 16 * dpr);
   const lab = p === 'ax' ? ['R', 'L', 'A', 'P'] : p === 'sag' ? ['A', 'P', 'S', 'I'] : ['R', 'L', 'S', 'I'];
   ctx.fillText(lab[0], 6 * dpr, cv.height / 2); ctx.fillText(lab[1], cv.width - 14 * dpr, cv.height / 2);
   ctx.fillText(lab[2], cv.width / 2, 30 * dpr); ctx.fillText(lab[3], cv.width / 2, cv.height - 6 * dpr);
@@ -826,18 +994,22 @@ window.addEventListener('mouseup', () => {
 // click = move the crosshair
 $('cv').addEventListener('click', e => {
   if (!meta || cropMode) return;
+  if (suppressClick) { suppressClick = false; return; }
+  if (noteClick(e)) return;
   const p = radio('plane'), [x, y] = toNative(e), k = (meta.n - 1) - y;
   if (p === 'ax') { pos.c = x; pos.r = y; }
   else if (p === 'sag') { pos.r = x; pos.k = k; }
   else { pos.c = x; pos.k = k; }
   draw();
 });
-$('slice').oninput = e => { setIdx(radio('plane'), +e.target.value); draw(); };
+$('slice').oninput = e => { setIdx(radio('plane'), +e.target.value); draw(); renderNotesPanel(); };
 $('wl').onchange = () => draw(); $('xhair').onchange = () => draw();
 document.querySelectorAll('input[name=plane]').forEach(r => r.onchange = () => { syncSlider(); draw(); });
 window.addEventListener('resize', () => draw());
 document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'number')) return;
+  if (e.target.tagName === 'TEXTAREA' && e.key === 'Escape') { e.target.blur(); return; }
+  if (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'number'))) return;
+  if (e.key === 'Escape') { cancelNote(); return; }
   if (!meta) return;
   const k = e.key.toLowerCase(), ids = ['pri', ...loadedIds()];
   if (k === 't' && ids.length > 1) selectImage(ids[(ids.indexOf(current) + 1) % ids.length]);
