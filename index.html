@@ -8,6 +8,7 @@
   body{font-family:system-ui,sans-serif;background:#111;color:#ddd;margin:16px}
   #wrap{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
   canvas{background:#000;cursor:crosshair}
+  canvas.cropping{cursor:cell}
   #rois{font-size:13px;max-height:85vh;overflow:auto;min-width:320px}
   #rois table{border-collapse:collapse}
   #rois td{padding:1px 4px}
@@ -16,45 +17,51 @@
   #rois .renamed{border-color:#c90 !important}
   pre{font-size:12px;white-space:pre-wrap;color:#9c9;max-height:22vh;overflow:auto}
   label{margin-right:12px}
-  fieldset{border:1px solid #444;margin:0 0 10px;padding:6px 10px}
-  input[type=number]{width:70px}
+  fieldset{border:1px solid #444;margin:0 0 8px;padding:6px 10px}
+  fieldset.sec legend b{color:#8cf}
+  .status{font-size:12px;margin-left:8px}
+  .status.ok{color:#9c9} .status.bad{color:#f88}
+  input[type=number]{width:60px}
   button{margin-right:4px}
+  .bar{margin:6px 0}
 </style>
 </head>
 <body>
 <h3>RT DICOM test (Pyodide + pydicom, files stay on this computer)</h3>
-<fieldset><legend>Primary</legend>
+<fieldset><legend>Primary (CT)</legend>
   <label>CT folder: <input type="file" id="ctDir" webkitdirectory multiple></label>
   <label>or CT files: <input type="file" id="ctFiles" multiple></label>
   <label>RTSTRUCT: <input type="file" id="rs"></label>
   <button id="go" disabled>Load primary</button>
 </fieldset>
-<fieldset><legend>Secondary</legend>
-  <label>Image folder: <input type="file" id="secDir" webkitdirectory multiple></label>
-  <label>or image files: <input type="file" id="secFiles" multiple></label>
-  <label>REG file: <input type="file" id="reg"></label>
-  <label><input type="checkbox" id="inv"> invert matrix</label>
-  <button id="go2" disabled>Load secondary</button>
-</fieldset>
-<p>
+<div id="secSlots"></div>
+<button id="addSec" disabled>+ Add another scan</button> <small>(up to 4 extra scans; a REG can link a scan to the CT or to another loaded scan)</small>
+
+<div class="bar">
   Plane: <label><input type="radio" name="plane" value="ax" checked> Axial</label>
   <label><input type="radio" name="plane" value="sag"> Sagittal</label>
   <label><input type="radio" name="plane" value="cor"> Coronal</label>
   <small>(A / S / C)</small>
-  &nbsp;|&nbsp; Image: <label><input type="radio" name="view" value="pri" checked> Primary</label>
-  <label><input type="radio" name="view" value="sec" id="vsec" disabled> Secondary</label>
-  <small>(T)</small>
+  &nbsp;|&nbsp; Image: <span id="imgSel"></span> <small>(T cycles, 1–5 select)</small>
   &nbsp;|&nbsp; <label><input type="checkbox" id="xhair" checked> crosshair</label>
-</p>
-<p>
+</div>
+<div class="bar">
+  Crop: <button id="cropAuto" disabled>Auto (body)</button>
+  <button id="cropRois" disabled>To structures</button>
+  <button id="cropDraw" disabled>Draw box</button>
+  <button id="cropReset" disabled>Reset</button>
+  margin <input type="number" id="cropMargin" value="15" min="0" max="100"> mm
+  <span id="cropInfo" class="status"></span>
+</div>
+<div class="bar">
   Slice <input type="range" id="slice" min="0" max="0" value="0" style="width:300px"> <span id="sl"></span>
   &nbsp; CT W/L: <select id="wl">
     <option value="400,40">Soft tissue 400/40</option>
     <option value="1600,-600">Lung 1600/-600</option>
     <option value="2000,300">Bone 2000/300</option>
   </select>
-  &nbsp; Secondary W <input type="number" id="sw"> L <input type="number" id="sl2">
-</p>
+  &nbsp; <span id="secWL">Scan W <input type="number" id="sw"> L <input type="number" id="sl2"></span>
+</div>
 <pre id="log">Loading Pyodide…</pre>
 <div id="wrap">
   <canvas id="cv"></canvas>
@@ -64,28 +71,24 @@
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <script src="https://cdn.jsdelivr.net/pyodide/v0.29.0/full/pyodide.js"></script>
 <script>
-const $ = id => document.getElementById(id);
-const log = m => { $('log').textContent += '\n' + m; $('log').scrollTop = 1e9; };
-let py, meta = null, rois = [], secLoaded = false;
-let pos = {k: 0, r: 0, c: 0};          // cursor in primary voxel indices (slice, row, col)
-let lineWidth = 1.5;
-const off = document.createElement('canvas');   // native-resolution image, scaled onto the visible canvas
-
 const PY = String.raw`
 import os, gc, json, numpy as np, pydicom
-P = None; S = None; RS = None; sec_cache = {}
+from collections import deque
 
-NON_IMAGE = {'RTSTRUCT', 'REG', 'RTPLAN', 'RTDOSE', 'RTRECORD', 'SR', 'PR', 'KO'}
-
+P = None          # primary series
+SEC = {}          # secondary id -> series (+ T, Ainv, cache, invert)
+REGS = {}         # secondary id -> REG dataset loaded with that slot
 ING, OTHER, FACTOR = {}, {}, {}
-VOXEL_BUDGET = 80_000_000      # max secondary voxels kept in memory (~320 MB float32)
+NON_IMAGE = {'RTSTRUCT', 'REG', 'RTPLAN', 'RTDOSE', 'RTRECORD', 'SR', 'PR', 'KO'}
+VOXEL_BUDGET = 80_000_000      # max voxels kept per secondary (stored float16 -> ~160 MB)
 
 def ingest_begin(tag, nfiles, downsample):
     """Start streaming a series in. Files are read one at a time and deleted immediately."""
-    global P, S, sec_cache
-    S = None; sec_cache = {}
+    global P
     if tag == 'pri':
-        P = None
+        P = None; SEC.clear(); REGS.clear()
+    else:
+        SEC.pop(tag, None); REGS.pop(tag, None)
     ING[tag], OTHER[tag] = [], []
     FACTOR[tag] = dict(n=nfiles, down=bool(downsample), f=None)
     gc.collect()
@@ -116,11 +119,14 @@ def ingest(tag, path):
         return 'multiframe-skipped'
     slope = float(getattr(d, 'RescaleSlope', 1) or 1); icpt = float(getattr(d, 'RescaleIntercept', 0) or 0)
     arr = arr.astype(np.float32) * slope + icpt
-    if f == 1 and slope.is_integer() and icpt.is_integer() and arr.min() >= -32768 and arr.max() <= 32767:
-        arr = arr.astype(np.int16)        # e.g. CT HU: half the memory of float32
     if f > 1:
         r, c = (arr.shape[0] // f) * f, (arr.shape[1] // f) * f
         arr = arr[:r, :c].reshape(r // f, f, c // f, f).mean(axis=(1, 3), dtype=np.float32)
+    if tag == 'pri':
+        if slope.is_integer() and icpt.is_integer() and arr.min() >= -32768 and arr.max() <= 32767:
+            arr = arr.astype(np.int16)        # CT HU: half the memory of float32
+    elif np.abs(arr).max() < 60000:
+        arr = arr.astype(np.float16)          # display only needs ~8 bits; quarter of float64, half of float32
     del d.PixelData
     if hasattr(d, '_pixel_array'):
         d._pixel_array = None
@@ -145,7 +151,8 @@ def build_series(tag):
     sel.sort(key=lambda t: float(np.dot(normal, np.array(t[0].ImagePositionPatient, float))))
     sl = [t[0] for t in sel]
     d0 = sl[0]             # first slice AFTER sorting (files arrive in arbitrary order)
-    dtype = np.int16 if all(t[1].dtype == np.int16 for t in sel) else np.float32
+    dts = {t[1].dtype for t in sel}
+    dtype = dts.pop() if len(dts) == 1 else np.float32
     vol = np.empty((len(sel),) + sel[0][1].shape, dtype)
     for i in range(len(sel)):
         vol[i] = sel[i][1]; sel[i] = None
@@ -170,14 +177,12 @@ def build_series(tag):
     return dict(slices=sl, vol=vol, row=row, col=col, normal=normal, ps=ps, pos=pos, gap=gap, A=A, info=info)
 
 def load(rs_path):
-    global P, S, RS, sec_cache
-    S = None; sec_cache = {}
+    global P
     P = build_series('pri')
     sl, ps, row, col, normal, pos = P['slices'], P['ps'], P['row'], P['col'], P['normal'], P['pos']
     uid_to_idx = {d.SOPInstanceUID: i for i, d in enumerate(sl)}
     out = []
     rs = pydicom.dcmread(rs_path, force=True) if rs_path else next((d for d in OTHER.get('pri', []) if d.Modality == 'RTSTRUCT'), None)
-    RS = rs
     if rs is not None:
         names = {r.ROINumber: r.ROIName for r in rs.StructureSetROISequence}
         tol = abs(P['gap']) / 2 or 1.0
@@ -210,6 +215,7 @@ def load(rs_path):
         P['info']['unmatchedContours'] = unmatched
     return json.dumps(dict(info=P['info'], rois=out))
 
+# ---------------- registration ----------------
 def matrix_seq(seq):
     M = np.eye(4)
     for m in seq:
@@ -236,52 +242,151 @@ def parse_reg(reg):
                 M = np.array(it.PostDeformationMatrixRegistrationSequence[0].FrameOfReferenceTransformationMatrix, float).reshape(4, 4) @ M
             mats[str(it.SourceFrameOfReferenceUID)] = M
     mats.setdefault(target, np.eye(4))
-    return mats, target, notes
+    return mats, notes
 
-def load_secondary(reg_path, invert):
-    global S, sec_cache
-    sec_cache = {}
+def for_label(f):
+    if P is not None and f == P['info']['FoR']:
+        return 'PRIMARY (' + (P['info']['series'] or P['info']['modality']) + ')'
+    for sid, s in SEC.items():
+        if s['info']['FoR'] == f:
+            return sid + ' (' + (s['info']['series'] or s['info']['modality']) + ')'
+    return 'unloaded FoR …' + f[-8:]
+
+def resolve_all():
+    """Chain every loaded REG into a graph of frames of reference and find primary -> secondary for each slot."""
+    edges = {}     # FoR a -> list of (FoR b, matrix a->b, via)
+    notes_by_reg = {}
+    for rid, reg in REGS.items():
+        mats, notes = parse_reg(reg)
+        notes_by_reg[rid] = notes
+        for a, Ma in mats.items():
+            for b, Mb in mats.items():
+                if a != b:
+                    edges.setdefault(a, []).append((b, np.linalg.inv(Mb) @ Ma, rid))
+    fP = P['info']['FoR']
+    out = {}
+    for sid, S in SEC.items():
+        fS = S['info']['FoR']
+        notes = list(notes_by_reg.get(sid, []))
+        T, path = None, []
+        if fS == fP:
+            T = np.eye(4); notes.append('Same frame of reference as primary: identity.')
+        else:
+            prev = {fP: None}; q = deque([fP])
+            while q:
+                a = q.popleft()
+                if a == fS: break
+                for b, M, rid in edges.get(a, []):
+                    if b not in prev:
+                        prev[b] = (a, M, rid); q.append(b)
+            if fS in prev:
+                chain, node = [], fS            # walk back from the secondary to the primary
+                while prev[node] is not None:
+                    a, M, rid = prev[node]
+                    chain.append(M); path.append(f'{for_label(a)} -> {for_label(node)} via REG loaded with {rid}')
+                    node = a
+                path.reverse()
+                T = np.eye(4)
+                for M in reversed(chain):       # apply the primary-side step first
+                    T = M @ T
+                notes.append('Registration path: ' + ' ; '.join(path))
+        status = 'registered'
+        if T is None:
+            T = np.eye(4); status = 'UNREGISTERED'
+            notes.append('WARNING: no registration links this scan to the primary (load its REG, or the REG of an intermediate scan). Shown with identity.')
+        if S.get('invert'):
+            T = np.linalg.inv(T); notes.append('Matrix inverted (debug option).')
+        if not np.allclose(T, S.get('T', np.full((4, 4), np.nan))):
+            S['cache'] = {}
+        S['T'] = T
+        out[sid] = dict(status=status, notes=notes, primaryToSecondary=np.round(T, 4).tolist())
+    return out
+
+def load_secondary(tag, reg_path, invert):
     reg = pydicom.dcmread(reg_path, force=True) if reg_path else None
     if reg is None:   # fall back to a REG sitting in the secondary folder
-        regs = [d for d in OTHER.get('sec', []) if getattr(d, 'Modality', '') == 'REG']
+        regs = [d for d in OTHER.get(tag, []) if getattr(d, 'Modality', '') == 'REG']
         reg = regs[0] if regs else None
-    S = build_series('sec')
-    fP, fS = P['info']['FoR'], S['info']['FoR']
-    notes = []
-    if reg is not None:
-        mats, target, notes = parse_reg(reg)
-        notes.append('REG frames of reference: ' + ', '.join(('PRIMARY' if k == fP else 'SECONDARY' if k == fS else k) for k in mats))
-        if fS not in mats:
-            raise ValueError('REG file does not reference the secondary frame of reference ' + fS)
-        if fP not in mats:
-            raise ValueError('REG file does not reference the primary frame of reference ' + fP)
-        T = np.linalg.inv(mats[fS]) @ mats[fP]     # primary patient mm -> secondary patient mm
-    elif fP == fS:
-        T = np.eye(4); notes.append('No REG file; same frame of reference, using identity.')
-    else:
-        T = np.eye(4); notes.append('WARNING: no REG file and different frames of reference; using identity.')
-    if invert:
-        T = np.linalg.inv(T); notes.append('Matrix inverted (debug option).')
-    S['T'] = T
+    S = build_series(tag)
     S['Ainv'] = np.linalg.inv(S['A'])
-    v = S['vol'][::max(1, S['vol'].shape[0] // 20)]
+    d = np.diff(S['pos'])
+    S['uniform'] = bool(len(d) == 0 or (d.max() - d.min()) < 0.05 * abs(S['gap']))
+    if not S['uniform']:
+        S['info']['note'] = f'Uneven slice spacing ({d.min():.2f}-{d.max():.2f} mm): using per-slice positions.'
+    S['invert'] = bool(invert)
+    S['cache'] = {}
+    SEC[tag] = S
+    if reg is not None:
+        REGS[tag] = reg
+    v = S['vol'][::max(1, S['vol'].shape[0] // 20)].astype(np.float32)
     lo, hi = np.percentile(v, [1, 99.5])
-    info = dict(S['info'], primaryToSecondary=np.round(T, 4).tolist(), notes=notes,
+    info = dict(S['info'], hasREG=reg is not None,
                 autoW=float(round(hi - lo, 1)), autoL=float(round((hi + lo) / 2, 1)))
-    return json.dumps(info)
+    return json.dumps(dict(info=info, all=resolve_all()))
 
+def set_invert(tag, invert):
+    SEC[tag]['invert'] = bool(invert)
+    return json.dumps(resolve_all())
+
+def remove_secondary(tag):
+    SEC.pop(tag, None); REGS.pop(tag, None); gc.collect()
+    return json.dumps(resolve_all())
+
+# ---------------- crop ----------------
+def _label_largest(m):
+    """Largest 4-connected component of a small 2D bool array (pure python BFS)."""
+    h, w = m.shape
+    lab = np.zeros((h, w), np.int32); best, best_n, cur = 0, 0, 0
+    for y0 in range(h):
+        for x0 in range(w):
+            if m[y0, x0] and not lab[y0, x0]:
+                cur += 1; n = 0; q = deque([(y0, x0)]); lab[y0, x0] = cur
+                while q:
+                    y, x = q.popleft(); n += 1
+                    for yy, xx in ((y-1, x), (y+1, x), (y, x-1), (y, x+1)):
+                        if 0 <= yy < h and 0 <= xx < w and m[yy, xx] and not lab[yy, xx]:
+                            lab[yy, xx] = cur; q.append((yy, xx))
+                if n > best_n: best, best_n = cur, n
+    return lab == best
+
+def auto_crop(margin_mm):
+    """Bounding box of the patient's body (largest connected blob, so the couch is excluded)."""
+    v = P['vol']; n, rows, cols = v.shape
+    step = max(1, n // 40)
+    sub = v[::step].astype(np.float32)
+    thr = -400.0 if P['info']['modality'] == 'CT' else float(np.percentile(sub, 99)) * 0.1
+    frac = (sub > thr).mean(axis=0)                   # how often each (row, col) is inside the body
+    f = 4
+    r4, c4 = rows // f, cols // f
+    m = frac[:r4 * f, :c4 * f].reshape(r4, f, c4, f).max(axis=(1, 3)) > 0.05
+    # open slightly so thin couch/body contacts break apart
+    er = m & np.roll(m, 1, 0) & np.roll(m, -1, 0) & np.roll(m, 1, 1) & np.roll(m, -1, 1)
+    body = _label_largest(er)
+    ys, xs = np.nonzero(body)
+    if not len(ys):
+        return json.dumps(dict(c0=0, c1=cols - 1, r0=0, r1=rows - 1, k0=0, k1=n - 1))
+    mr, mc = margin_mm / P['ps'][0], margin_mm / P['ps'][1]
+    r0 = max(0, int(ys.min() * f - f - mr)); r1 = min(rows - 1, int((ys.max() + 1) * f + f + mr))
+    c0 = max(0, int(xs.min() * f - f - mc)); c1 = min(cols - 1, int((xs.max() + 1) * f + f + mc))
+    # z: slices where the body is present at all
+    zs = np.nonzero((v[:, r0:r1 + 1:4, c0:c1 + 1:4] > thr).mean(axis=(1, 2)) > 0.01)[0]
+    k0, k1 = (int(zs.min()), int(zs.max())) if len(zs) else (0, n - 1)
+    return json.dumps(dict(c0=c0, c1=c1, r0=r0, r1=r1, k0=k0, k1=k1))
+
+# ---------------- planes ----------------
 _grid = {}
 def plane_shape(view):
     n, rows, cols = P['vol'].shape
     return {'ax': (rows, cols), 'sag': (n, rows), 'cor': (n, cols)}[view]
 
-def sec_plane(view, i):
-    """Resample the secondary onto a primary plane (trilinear, NaN outside).
+def sec_plane(sid, view, i):
+    """Resample a secondary onto a primary plane (trilinear, NaN outside).
     ax: (rows, cols) at slice i; sag: (n, rows) at column i; cor: (n, cols) at row i.
     Sag/cor are returned superior-at-top (slice order flipped)."""
+    S = SEC[sid]; cache = S['cache']
     i = int(i); key = (view, i)
-    if key in sec_cache:
-        return sec_cache[key]
+    if key in cache:
+        return cache[key]
     h, w = plane_shape(view)
     gk = (view, h, w)
     if gk not in _grid:
@@ -298,9 +403,15 @@ def sec_plane(view, i):
         pts = np.stack([i * one, xx, (n - 1) - yy, one])
     else:
         pts = np.stack([xx, i * one, (n - 1) - yy, one])
-    K = S['Ainv'] @ S['T'] @ Ap                    # primary voxel -> secondary voxel
-    c, r, k = (K @ pts)[:3]
+    pat = S['T'] @ Ap @ pts                        # primary voxel -> secondary patient mm
+    c, r = (S['Ainv'] @ pat)[:2]
+    # slice index from each slice's actual position (handles uneven spacing / missing slices)
+    z = S['normal'] @ pat[:3]
     vol = S['vol']; nk, nr, nc = vol.shape
+    if S['uniform']:
+        k = (z - S['pos'][0]) / S['gap']
+    else:
+        k = np.interp(z, S['pos'], np.arange(nk, dtype=np.float64), left=-1.0, right=nk + 1.0)
     c0, r0, k0 = np.floor(c).astype(int), np.floor(r).astype(int), np.floor(k).astype(int)
     fc, fr, fk = c - c0, r - r0, k - k0
     if nk == 1:
@@ -308,15 +419,15 @@ def sec_plane(view, i):
     ok = (c0 >= 0) & (c0 < nc - 1) & (r0 >= 0) & (r0 < nr - 1) & (k0 >= 0) & (k0 < max(nk - 1, 1))
     c0, r0, k0 = np.clip(c0, 0, nc - 2), np.clip(r0, 0, nr - 2), np.clip(k0, 0, max(nk - 2, 0))
     k1 = np.minimum(k0 + 1, nk - 1)
-    def g(kk, rr_, cc_): return vol[kk, rr_, cc_]
+    def g(kk, rr_, cc_): return vol[kk, rr_, cc_].astype(np.float32)
     val = ((g(k0, r0, c0) * (1 - fc) + g(k0, r0, c0 + 1) * fc) * (1 - fr) +
            (g(k0, r0 + 1, c0) * (1 - fc) + g(k0, r0 + 1, c0 + 1) * fc) * fr) * (1 - fk) + \
           ((g(k1, r0, c0) * (1 - fc) + g(k1, r0, c0 + 1) * fc) * (1 - fr) +
            (g(k1, r0 + 1, c0) * (1 - fc) + g(k1, r0 + 1, c0 + 1) * fc) * fr) * fk
     out = np.where(ok, val, np.nan).reshape(h, w).astype(np.float32)
-    if len(sec_cache) > 60:
-        sec_cache.clear()
-    sec_cache[key] = out
+    if len(cache) > 40:
+        cache.clear()
+    cache[key] = out
     return out
 
 def pri_plane(view, i):
@@ -328,37 +439,24 @@ def pri_plane(view, i):
     return v[::-1, i, :]
 
 def plane_rgba(view, i, ww, wl, which):
-    a = sec_plane(view, i) if which == 'sec' else pri_plane(view, i)
+    a = pri_plane(view, i) if which == 'pri' else sec_plane(which, view, i)
     lo = wl - ww / 2
     g = np.clip((np.nan_to_num(np.asarray(a, np.float32), nan=-1e9) - lo) / max(ww, 1e-6) * 255, 0, 255).astype(np.uint8)
     rgba = np.empty(g.shape + (4,), np.uint8)
     rgba[..., 0] = g; rgba[..., 1] = g; rgba[..., 2] = g; rgba[..., 3] = 255
-    if which == 'sec':   # tint area outside the secondary dark blue so coverage is visible
+    if which != 'pri':   # tint area outside the secondary dark blue so coverage is visible
         m = np.isnan(a); rgba[m, 0] = 0; rgba[m, 1] = 0; rgba[m, 2] = 40
     return np.frombuffer(rgba.tobytes(), np.uint8)
-
-def export_rs(edits_json):
-    """Apply renamed ROI names/colours to a copy of the RTSTRUCT and return the file bytes."""
-    import copy, io
-    from pydicom.uid import generate_uid
-    if RS is None:
-        raise ValueError('No RTSTRUCT loaded')
-    ds = copy.deepcopy(RS)
-    edits = {int(e['number']): e for e in json.loads(edits_json)}
-    for r in ds.StructureSetROISequence:
-        if int(r.ROINumber) in edits:
-            r.ROIName = edits[int(r.ROINumber)]['name'][:64]
-    for rc in ds.ROIContourSequence:
-        if int(rc.ReferencedROINumber) in edits:
-            rc.ROIDisplayColor = [int(x) for x in edits[int(rc.ReferencedROINumber)]['color']]
-    new_uid = generate_uid()
-    ds.SOPInstanceUID = new_uid
-    if hasattr(ds, 'file_meta'):
-        ds.file_meta.MediaStorageSOPInstanceUID = new_uid
-    buf = io.BytesIO()
-    ds.save_as(buf, enforce_file_format=False)
-    return np.frombuffer(buf.getvalue(), np.uint8)
 `;
+const $ = id => document.getElementById(id);
+const log = m => { $('log').textContent += '\n' + m; $('log').scrollTop = 1e9; };
+let py, meta = null, rois = [];
+let pos = {k: 0, r: 0, c: 0};          // cursor in primary voxel indices (slice, row, col)
+let crop = null;                        // {c0,c1,r0,r1,k0,k1} inclusive, primary voxel indices
+let lineWidth = 1.5, current = 'pri';
+const off = document.createElement('canvas');   // native-resolution plane image
+const SLOT_IDS = ['s1', 's2', 's3', 's4'];
+const secs = {};                         // id -> {shown, loaded, label, ww, wl, status}
 
 (async () => {
   try {
@@ -394,10 +492,11 @@ async function writeOne(file, tag) {
   py.FS.writeFile(p, new Uint8Array(await file.arrayBuffer()));
   return p;
 }
-
 const hex = c => '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
 const unhex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 
+// ---------- primary ----------
 $('go').onclick = async () => {
   try {
     const ctFiles = [...$('ctDir').files, ...$('ctFiles').files];
@@ -412,41 +511,106 @@ $('go').onclick = async () => {
       ks: Object.keys(r.slices).map(Number).sort((a, b) => a - b)}));
     log(`Primary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(meta));
     pos = {k: Math.floor(meta.n / 2), r: Math.floor(meta.rows / 2), c: Math.floor(meta.cols / 2)};
+    crop = null; current = 'pri';
+    initSlots();
     buildRoiPanel();
-    secLoaded = false; $('vsec').disabled = true; setRadio('view', 'pri');
-    $('go2').disabled = false;
-    syncSlider(); draw();
+    ['cropAuto', 'cropDraw', 'cropReset', 'addSec'].forEach(id => $(id).disabled = false);
+    $('cropRois').disabled = !rois.length;
+    cropAuto();                       // CTs come in with a lot of air/couch: crop by default
   } catch (e) { log('ERROR: ' + e); console.error(e); }
 };
 
-$('go2').onclick = async () => {
+// ---------- secondary slots ----------
+function initSlots() {
+  $('secSlots').innerHTML = SLOT_IDS.map((id, n) => `
+    <fieldset class="sec" id="slot_${id}" style="display:none"><legend>Scan ${n + 2} <b id="lab_${id}"></b></legend>
+      <label>Image folder: <input type="file" id="dir_${id}" webkitdirectory multiple></label>
+      <label>or files: <input type="file" id="files_${id}" multiple></label>
+      <label>REG file: <input type="file" id="reg_${id}"></label>
+      <label><input type="checkbox" id="inv_${id}"> invert</label>
+      <button id="load_${id}">Load</button><button id="rm_${id}">Remove</button>
+      <span class="status" id="st_${id}"></span>
+    </fieldset>`).join('');
+  SLOT_IDS.forEach(id => {
+    secs[id] = {shown: false, loaded: false, label: '', ww: 0, wl: 0, status: ''};
+    $('load_' + id).onclick = () => loadSecondary(id);
+    $('rm_' + id).onclick = () => removeSecondary(id);
+    $('inv_' + id).onchange = e => { if (secs[id].loaded) applyResolve(JSON.parse(py.globals.get('set_invert')(id, e.target.checked))); };
+  });
+  showSlot('s1');
+  buildImgSel();
+}
+function showSlot(id) { secs[id].shown = true; $('slot_' + id).style.display = ''; $('addSec').disabled = SLOT_IDS.every(i => secs[i].shown); }
+$('addSec').onclick = () => { const id = SLOT_IDS.find(i => !secs[i].shown); if (id) showSlot(id); };
+
+async function loadSecondary(id) {
   try {
-    const files = [...$('secDir').files, ...$('secFiles').files];
-    if (!files.length) return log('Pick secondary image files first.');
-    secLoaded = false; $('vsec').disabled = true; setRadio('view', 'pri'); draw();
+    const files = [...$('dir_' + id).files, ...$('files_' + id).files];
+    if (!files.length) return log(`Scan ${id}: pick image files first.`);
+    secs[id].loaded = false; if (current === id) current = 'pri'; buildImgSel(); draw();
     const t = performance.now();
-    log(`Reading ${files.length} secondary files…`);
-    await ingestFiles(files, 'sec', true);
-    const regPath = await writeOne($('reg').files[0], 'reg');
-    const info = JSON.parse(py.globals.get('load_secondary')(regPath, $('inv').checked));
-    log(`Secondary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(info));
-    $('sw').value = info.autoW; $('sl2').value = info.autoL;
-    secLoaded = true; $('vsec').disabled = false; setRadio('view', 'sec');
-    draw();
+    log(`Reading ${files.length} files for ${id}…`);
+    await ingestFiles(files, id, true);
+    const regPath = await writeOne($('reg_' + id).files[0], 'reg');
+    const res = JSON.parse(py.globals.get('load_secondary')(id, regPath, $('inv_' + id).checked));
+    const info = res.info;
+    log(`${id} parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(info));
+    Object.assign(secs[id], {loaded: true, label: info.series || info.modality, ww: info.autoW, wl: info.autoL});
+    $('lab_' + id).textContent = `${info.modality} · ${secs[id].label}`;
+    applyResolve(res.all);
+    current = id; buildImgSel(); draw();
   } catch (e) { log('ERROR: ' + e); console.error(e); }
-};
+}
+function removeSecondary(id) {
+  if (secs[id].loaded) applyResolve(JSON.parse(py.globals.get('remove_secondary')(id)));
+  Object.assign(secs[id], {loaded: false, label: '', status: ''});
+  $('lab_' + id).textContent = ''; $('st_' + id).textContent = '';
+  ['dir_', 'files_', 'reg_'].forEach(p => $(p + id).value = '');
+  if (id !== 's1') { secs[id].shown = false; $('slot_' + id).style.display = 'none'; $('addSec').disabled = false; }
+  if (current === id) current = 'pri';
+  buildImgSel(); draw();
+}
+// registration status for every loaded scan (adding a REG can link scans loaded earlier)
+function applyResolve(all) {
+  for (const id of SLOT_IDS) {
+    const st = $('st_' + id), r = all[id];
+    if (!r) continue;
+    secs[id].status = r.status;
+    st.textContent = r.status === 'registered' ? '✓ ' + (r.notes.find(n => n.startsWith('Registration path') || n.startsWith('Same')) || 'registered')
+                                               : '⚠ not linked to primary – shown unregistered';
+    st.className = 'status ' + (r.status === 'registered' ? 'ok' : 'bad');
+    log(`${id}: ${r.status}. ${r.notes.join(' ')} T=${JSON.stringify(r.primaryToSecondary)}`);
+  }
+  buildImgSel(); draw();
+}
+function loadedIds() { return SLOT_IDS.filter(i => secs[i].loaded); }
+function buildImgSel() {
+  const opts = [['pri', 'CT'], ...loadedIds().map(i => [i, secs[i].label + (secs[i].status === 'UNREGISTERED' ? ' ⚠' : '')])];
+  $('imgSel').innerHTML = opts.map(([v, l], n) =>
+    `<label><input type="radio" name="img" value="${v}" ${v === current ? 'checked' : ''}> ${n + 1}: ${esc(l)}</label>`).join('');
+  document.querySelectorAll('input[name=img]').forEach(r => r.onchange = e => { current = e.target.value; syncWL(); draw(); });
+  syncWL();
+}
+function syncWL() {
+  const s = secs[current];
+  $('secWL').style.opacity = s ? 1 : .4;
+  $('sw').disabled = $('sl2').disabled = !s;
+  if (s) { $('sw').value = s.ww; $('sl2').value = s.wl; }
+}
+$('sw').oninput = () => { if (secs[current]) { secs[current].ww = +$('sw').value; draw(); } };
+$('sl2').oninput = () => { if (secs[current]) { secs[current].wl = +$('sl2').value; draw(); } };
+function selectImage(v) { current = v; buildImgSel(); draw(); }
 
 // ---------- structure panel ----------
 function buildRoiPanel() {
   const el = $('rois');
   el.innerHTML = `<b>${rois.length} structures</b><br>
     <button id="allOn">All on</button><button id="allOff">All off</button>
-    &nbsp; Line width <input type="range" id="lw" min="0.5" max="5" step="0.5" value="${lineWidth}" style="width:90px"> <span id="lwv">${lineWidth}</span><br>
-    <button id="exp" ${rois.length ? '' : 'disabled'}>Download renamed RTSTRUCT</button>
+    &nbsp; Line width <input type="range" id="lw" min="0.5" max="5" step="0.5" value="${lineWidth}" style="width:90px"> <span id="lwv">${lineWidth}</span>
     <table>${rois.map((r, i) => `<tr>
       <td><input type="checkbox" data-i="${i}" class="vis" checked></td>
       <td><input type="color" data-i="${i}" class="col" value="${hex(r.color)}"></td>
-      <td><input type="text" data-i="${i}" class="nm" value="${r.name.replace(/"/g, '&quot;')}" title="Original: ${r.origName.replace(/"/g, '&quot;')}"></td>
+      <td><input type="text" data-i="${i}" class="nm" value="${esc(r.name)}" title="Original: ${esc(r.origName)}"></td>
       <td><small>${r.nContours} contours</small></td>
       <td><button data-i="${i}" class="go" title="Jump to centre slice">&#8982;</button></td></tr>`).join('')}</table>`;
   el.querySelectorAll('.vis').forEach(x => x.onchange = e => { rois[+e.target.dataset.i].visible = e.target.checked; draw(); });
@@ -461,63 +625,94 @@ function buildRoiPanel() {
     const pts = r.slices[k].flat(); let sx = 0, sy = 0;
     for (let j = 0; j < pts.length; j += 2) { sx += pts[j]; sy += pts[j + 1]; }
     pos = {k, c: Math.round(sx / (pts.length / 2)), r: Math.round(sy / (pts.length / 2))};
-    syncSlider(); draw();
+    clampPos(); syncSlider(); draw();
   });
   $('allOn').onclick = () => setAll(true); $('allOff').onclick = () => setAll(false);
   $('lw').oninput = e => { lineWidth = +e.target.value; $('lwv').textContent = lineWidth; draw(); };
-  $('exp').onclick = exportRs;
 }
 function setAll(v) { rois.forEach(r => r.visible = v); $('rois').querySelectorAll('.vis').forEach(x => x.checked = v); draw(); }
 
-function exportRs() {
-  try {
-    const edits = rois.map(r => ({number: r.number, name: r.name, color: r.color}));
-    const proxy = py.globals.get('export_rs')(JSON.stringify(edits));
-    const bytes = proxy.toJs(); proxy.destroy();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([bytes], {type: 'application/dicom'}));
-    a.download = 'RS_renamed.dcm'; a.click();
-    const n = rois.filter(r => r.name !== r.origName).length;
-    log(`Exported RTSTRUCT with ${n} renamed structure(s) and a new SOP Instance UID.`);
-  } catch (e) { log('ERROR: ' + e); }
+// ---------- crop ----------
+const fullCrop = () => ({c0: 0, c1: meta.cols - 1, r0: 0, r1: meta.rows - 1, k0: 0, k1: meta.n - 1});
+function setCrop(c, why) {
+  const f = fullCrop();
+  crop = {c0: Math.max(f.c0, Math.min(c.c0, c.c1)), c1: Math.min(f.c1, Math.max(c.c0, c.c1)),
+          r0: Math.max(f.r0, Math.min(c.r0, c.r1)), r1: Math.min(f.r1, Math.max(c.r0, c.r1)),
+          k0: Math.max(f.k0, Math.min(c.k0, c.k1)), k1: Math.min(f.k1, Math.max(c.k0, c.k1))};
+  const mm = (a, b, s) => ((b - a + 1) * s).toFixed(0);
+  $('cropInfo').textContent = `${why}: ${mm(crop.c0, crop.c1, meta.ps[1])} × ${mm(crop.r0, crop.r1, meta.ps[0])} × ${mm(crop.k0, crop.k1, Math.abs(meta.sliceGap))} mm (R-L × A-P × S-I)`;
+  $('cropInfo').className = 'status ok';
+  clampPos(); syncSlider(); draw();
+}
+function cropAuto() {
+  setCrop(JSON.parse(py.globals.get('auto_crop')(+$('cropMargin').value)), 'Body');
+}
+$('cropAuto').onclick = cropAuto;
+$('cropReset').onclick = () => setCrop(fullCrop(), 'Full');
+$('cropRois').onclick = () => {
+  const vis = rois.filter(r => r.visible && r.ks.length);
+  if (!vis.length) return log('No visible structures to crop to.');
+  let c0 = 1e9, c1 = -1e9, r0 = 1e9, r1 = -1e9, k0 = 1e9, k1 = -1e9;
+  for (const r of vis) for (const k of r.ks) {
+    k0 = Math.min(k0, k); k1 = Math.max(k1, k);
+    for (const poly of r.slices[k]) for (let j = 0; j < poly.length; j += 2) {
+      c0 = Math.min(c0, poly[j]); c1 = Math.max(c1, poly[j]); r0 = Math.min(r0, poly[j + 1]); r1 = Math.max(r1, poly[j + 1]);
+    }
+  }
+  const m = +$('cropMargin').value, gap = Math.abs(meta.sliceGap) || 1;
+  setCrop({c0: Math.floor(c0 - m / meta.ps[1]), c1: Math.ceil(c1 + m / meta.ps[1]),
+           r0: Math.floor(r0 - m / meta.ps[0]), r1: Math.ceil(r1 + m / meta.ps[0]),
+           k0: Math.floor(k0 - m / gap), k1: Math.ceil(k1 + m / gap)}, 'Visible structures');
+};
+let cropMode = false, drag = null;
+$('cropDraw').onclick = () => { cropMode = !cropMode; $('cv').classList.toggle('cropping', cropMode);
+  $('cropDraw').textContent = cropMode ? 'Drag on image…' : 'Draw box'; };
+function clampPos() {
+  if (!crop) return;
+  pos.k = Math.max(crop.k0, Math.min(crop.k1, pos.k));
+  pos.r = Math.max(crop.r0, Math.min(crop.r1, pos.r));
+  pos.c = Math.max(crop.c0, Math.min(crop.c1, pos.c));
 }
 
 // ---------- planes ----------
 const radio = n => document.querySelector(`input[name=${n}]:checked`).value;
 const setRadio = (n, v) => { document.querySelector(`input[name=${n}][value=${v}]`).checked = true; };
 
-// image size (native px) and physical size (mm) of each plane
+// native plane size, crop window within it (native px), physical size of the window, slider range
 function planeGeom(p) {
-  const {n, rows, cols, ps} = meta, gap = Math.abs(meta.sliceGap) || 1;
-  if (p === 'ax')  return {w: cols, h: rows, mmW: cols * ps[1], mmH: rows * ps[0], max: n - 1, idx: pos.k};
-  if (p === 'sag') return {w: rows, h: n, mmW: rows * ps[0], mmH: n * gap, max: cols - 1, idx: pos.c};
-  return               {w: cols, h: n, mmW: cols * ps[1], mmH: n * gap, max: rows - 1, idx: pos.r};
+  const {n, rows, cols, ps} = meta, gap = Math.abs(meta.sliceGap) || 1, c = crop || fullCrop();
+  const yk0 = (n - 1) - c.k1, yk1 = (n - 1) - c.k0;
+  let g;
+  if (p === 'ax')       g = {w: cols, h: rows, x0: c.c0, x1: c.c1, y0: c.r0, y1: c.r1, psx: ps[1], psy: ps[0], min: c.k0, max: c.k1, idx: pos.k};
+  else if (p === 'sag') g = {w: rows, h: n, x0: c.r0, x1: c.r1, y0: yk0, y1: yk1, psx: ps[0], psy: gap, min: c.c0, max: c.c1, idx: pos.c};
+  else                  g = {w: cols, h: n, x0: c.c0, x1: c.c1, y0: yk0, y1: yk1, psx: ps[1], psy: gap, min: c.r0, max: c.r1, idx: pos.r};
+  g.cw = g.x1 - g.x0 + 1; g.ch = g.y1 - g.y0 + 1; g.mmW = g.cw * g.psx; g.mmH = g.ch * g.psy;
+  return g;
 }
 function setIdx(p, v) { if (p === 'ax') pos.k = v; else if (p === 'sag') pos.c = v; else pos.r = v; }
 function syncSlider() {
   if (!meta) return;
   const g = planeGeom(radio('plane'));
-  $('slice').max = g.max; $('slice').value = g.idx;
+  $('slice').min = g.min; $('slice').max = g.max; $('slice').value = g.idx;
 }
 
 // Structure outline in a sagittal/coronal plane: rasterise each axial contour's crossings with the
 // plane line (even-odd), then trace the resulting 2D mask with d3.contours.
 function reslicedOutline(r, p, idx, g) {
   if (!r.ks.length) return null;
-  const n = meta.n, W = g.w, H = g.h;
+  const n = meta.n, W = g.w;
   const kmin = r.ks[0], kmax = r.ks[r.ks.length - 1];
-  const y0 = (n - 1) - kmax, y1 = (n - 1) - kmin;     // display rows touched
-  const bh = y1 - y0 + 3;                               // 1-row padding each side
+  const y0 = (n - 1) - kmax, y1 = (n - 1) - kmin;
+  const bh = y1 - y0 + 3;
   const grid = new Float32Array(W * bh);
   let any = false;
-  const L = idx;                                        // line position (pixel-centre coords)
+  const L = idx;
   for (const k of r.ks) {
     const xs = [];
     for (const poly of r.slices[k]) {
       const m = poly.length;
       for (let j = 0; j < m; j += 2) {
         const ax = poly[j], ay = poly[j + 1], bx = poly[(j + 2) % m], by = poly[(j + 3) % m];
-        // sag: line x = L, crossing gives y (row); cor: line y = L, crossing gives x (col)
         const [u0, v0, u1, v1] = p === 'sag' ? [ax, ay, bx, by] : [ay, ax, by, bx];
         if ((u0 <= L) !== (u1 <= L)) xs.push(v0 + (L - u0) / (u1 - u0) * (v1 - v0));
       }
@@ -535,17 +730,16 @@ function reslicedOutline(r, p, idx, g) {
   return {mp, yoff: y0 - 1};
 }
 
-function draw() {
+function draw(overlay) {
   if (!meta) return;
   const p = radio('plane'), g = planeGeom(p);
-  const which = secLoaded && radio('view') === 'sec' ? 'sec' : 'pri';
-  const [ww, wl] = which === 'sec' ? [+$('sw').value, +$('sl2').value] : $('wl').value.split(',').map(Number);
+  const which = secs[current] && secs[current].loaded ? current : 'pri';
+  const [ww, wl] = which !== 'pri' ? [secs[which].ww, secs[which].wl] : $('wl').value.split(',').map(Number);
   const proxy = py.globals.get('plane_rgba')(p, g.idx, ww, wl, which);
   const buf = proxy.toJs(); proxy.destroy();
   off.width = g.w; off.height = g.h;
   off.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(buf.buffer, buf.byteOffset, buf.length), g.w, g.h), 0, 0);
 
-  // visible canvas: physical aspect ratio, device-pixel sharp
   const dpr = window.devicePixelRatio || 1;
   const maxW = Math.min(window.innerWidth - 380, 760), maxH = window.innerHeight * 0.8;
   const scale = Math.min(maxW / g.mmW, maxH / g.mmH);
@@ -555,8 +749,9 @@ function draw() {
   cv.width = cssW * dpr; cv.height = cssH * dpr;
   const ctx = cv.getContext('2d');
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(off, 0, 0, cv.width, cv.height);
-  const sx = cv.width / g.w, sy = cv.height / g.h;     // native image px -> canvas px
+  ctx.drawImage(off, g.x0, g.y0, g.cw, g.ch, 0, 0, cv.width, cv.height);
+  const sx = cv.width / g.cw, sy = cv.height / g.ch;
+  const X = x => (x - g.x0 + .5) * sx, Y = y => (y - g.y0 + .5) * sy;   // pixel-centre coords -> canvas
   ctx.lineWidth = lineWidth * dpr; ctx.lineJoin = 'round';
 
   for (const r of rois) {
@@ -565,64 +760,94 @@ function draw() {
     if (p === 'ax') {
       const cs = r.slices[pos.k]; if (!cs) continue;
       for (const c of cs) {
-        ctx.beginPath(); ctx.moveTo((c[0] + .5) * sx, (c[1] + .5) * sy);
-        for (let k = 2; k < c.length; k += 2) ctx.lineTo((c[k] + .5) * sx, (c[k + 1] + .5) * sy);
+        ctx.beginPath(); ctx.moveTo(X(c[0]), Y(c[1]));
+        for (let k = 2; k < c.length; k += 2) ctx.lineTo(X(c[k]), Y(c[k + 1]));
         ctx.closePath(); ctx.stroke();
       }
     } else {
       const o = reslicedOutline(r, p, g.idx, g); if (!o) continue;
       ctx.beginPath();
-      for (const poly of o.mp.coordinates) for (const ring of poly) {
-        ring.forEach(([x, y], j) => { const X = x * sx, Y = (y + o.yoff) * sy; j ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
+      for (const poly of o.mp.coordinates) for (const ring of poly) {   // d3 grid coords are cell-edge based
+        ring.forEach(([x, y], j) => { const cx = (x - g.x0) * sx, cy = (y + o.yoff - g.y0) * sy; j ? ctx.lineTo(cx, cy) : ctx.moveTo(cx, cy); });
         ctx.closePath();
       }
       ctx.stroke();
     }
   }
 
-  if ($('xhair').checked) {      // crosshair = position of the other two planes
+  if ($('xhair').checked) {
     const n = meta.n;
     const [cx, cy] = p === 'ax' ? [pos.c, pos.r] : p === 'sag' ? [pos.r, (n - 1) - pos.k] : [pos.c, (n - 1) - pos.k];
     ctx.save(); ctx.strokeStyle = 'rgba(255,255,0,.45)'; ctx.lineWidth = dpr; ctx.setLineDash([4 * dpr, 4 * dpr]);
-    ctx.beginPath(); ctx.moveTo((cx + .5) * sx, 0); ctx.lineTo((cx + .5) * sx, cv.height);
-    ctx.moveTo(0, (cy + .5) * sy); ctx.lineTo(cv.width, (cy + .5) * sy); ctx.stroke(); ctx.restore();
+    ctx.beginPath(); ctx.moveTo(X(cx), 0); ctx.lineTo(X(cx), cv.height);
+    ctx.moveTo(0, Y(cy)); ctx.lineTo(cv.width, Y(cy)); ctx.stroke(); ctx.restore();
+  }
+  if (overlay) {   // crop box being dragged
+    ctx.save(); ctx.strokeStyle = '#0ff'; ctx.lineWidth = 2 * dpr; ctx.setLineDash([6 * dpr, 4 * dpr]);
+    ctx.strokeRect(X(Math.min(overlay.x0, overlay.x1)) - sx / 2, Y(Math.min(overlay.y0, overlay.y1)) - sy / 2,
+                   (Math.abs(overlay.x1 - overlay.x0) + 1) * sx, (Math.abs(overlay.y1 - overlay.y0) + 1) * sy);
+    ctx.restore();
   }
   ctx.fillStyle = '#ff0'; ctx.font = `${12 * dpr}px system-ui`;
   const names = {ax: 'AXIAL', sag: 'SAGITTAL', cor: 'CORONAL'};
-  ctx.fillText(`${names[p]} · ${which === 'sec' ? 'SECONDARY (registered)' : 'PRIMARY'}`, 6 * dpr, 16 * dpr);
+  ctx.fillText(`${names[p]} · ${which === 'pri' ? 'CT (primary)' : secs[which].label + (secs[which].status === 'UNREGISTERED' ? ' — UNREGISTERED' : ' (registered)')}`, 6 * dpr, 16 * dpr);
   const lab = p === 'ax' ? ['R', 'L', 'A', 'P'] : p === 'sag' ? ['A', 'P', 'S', 'I'] : ['R', 'L', 'S', 'I'];
   ctx.fillText(lab[0], 6 * dpr, cv.height / 2); ctx.fillText(lab[1], cv.width - 14 * dpr, cv.height / 2);
   ctx.fillText(lab[2], cv.width / 2, 30 * dpr); ctx.fillText(lab[3], cv.width / 2, cv.height - 6 * dpr);
-  $('sl').textContent = `${g.idx + 1} / ${g.max + 1}`;
+  $('sl').textContent = `${g.idx - g.min + 1} / ${g.max - g.min + 1}`;
 }
 
-// click = move the crosshair (sets position for the other two planes)
+// canvas position -> native plane pixel
+function toNative(e) {
+  const g = planeGeom(radio('plane')), rect = $('cv').getBoundingClientRect();
+  const x = g.x0 + Math.floor((e.clientX - rect.left) / rect.width * g.cw);
+  const y = g.y0 + Math.floor((e.clientY - rect.top) / rect.height * g.ch);
+  return [Math.max(g.x0, Math.min(g.x1, x)), Math.max(g.y0, Math.min(g.y1, y))];
+}
+$('cv').addEventListener('mousedown', e => {
+  if (!meta || !cropMode) return;
+  const [x, y] = toNative(e); drag = {x0: x, y0: y, x1: x, y1: y};
+});
+$('cv').addEventListener('mousemove', e => {
+  if (!drag) return;
+  [drag.x1, drag.y1] = toNative(e); draw(drag);
+});
+window.addEventListener('mouseup', () => {
+  if (!drag) return;
+  const d = drag; drag = null; cropMode = false; $('cv').classList.remove('cropping'); $('cropDraw').textContent = 'Draw box';
+  if (Math.abs(d.x1 - d.x0) < 4 || Math.abs(d.y1 - d.y0) < 4) return draw();
+  const p = radio('plane'), n = meta.n, c = {...(crop || fullCrop())};
+  const xa = Math.min(d.x0, d.x1), xb = Math.max(d.x0, d.x1), ya = Math.min(d.y0, d.y1), yb = Math.max(d.y0, d.y1);
+  if (p === 'ax') Object.assign(c, {c0: xa, c1: xb, r0: ya, r1: yb});
+  else if (p === 'sag') Object.assign(c, {r0: xa, r1: xb, k0: (n - 1) - yb, k1: (n - 1) - ya});
+  else Object.assign(c, {c0: xa, c1: xb, k0: (n - 1) - yb, k1: (n - 1) - ya});
+  setCrop(c, 'Drawn');
+});
+// click = move the crosshair
 $('cv').addEventListener('click', e => {
-  if (!meta) return;
-  const p = radio('plane'), g = planeGeom(p), rect = e.target.getBoundingClientRect();
-  const x = Math.max(0, Math.min(g.w - 1, Math.floor((e.clientX - rect.left) / rect.width * g.w)));
-  const y = Math.max(0, Math.min(g.h - 1, Math.floor((e.clientY - rect.top) / rect.height * g.h)));
-  const k = (meta.n - 1) - y;
+  if (!meta || cropMode) return;
+  const p = radio('plane'), [x, y] = toNative(e), k = (meta.n - 1) - y;
   if (p === 'ax') { pos.c = x; pos.r = y; }
   else if (p === 'sag') { pos.r = x; pos.k = k; }
   else { pos.c = x; pos.k = k; }
   draw();
 });
 $('slice').oninput = e => { setIdx(radio('plane'), +e.target.value); draw(); };
-$('wl').onchange = draw; $('sw').oninput = draw; $('sl2').oninput = draw; $('xhair').onchange = draw;
-document.querySelectorAll('input[name=view]').forEach(r => r.onchange = draw);
+$('wl').onchange = () => draw(); $('xhair').onchange = () => draw();
 document.querySelectorAll('input[name=plane]').forEach(r => r.onchange = () => { syncSlider(); draw(); });
-window.addEventListener('resize', draw);
+window.addEventListener('resize', () => draw());
 document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
-  const k = e.key.toLowerCase();
-  if (k === 't' && secLoaded) { setRadio('view', radio('view') === 'sec' ? 'pri' : 'sec'); draw(); }
+  if (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'number')) return;
+  if (!meta) return;
+  const k = e.key.toLowerCase(), ids = ['pri', ...loadedIds()];
+  if (k === 't' && ids.length > 1) selectImage(ids[(ids.indexOf(current) + 1) % ids.length]);
+  if (/^[1-5]$/.test(k) && ids[+k - 1]) selectImage(ids[+k - 1]);
   if (k === 'a' || k === 's' || k === 'c') { setRadio('plane', {a: 'ax', s: 'sag', c: 'cor'}[k]); syncSlider(); draw(); }
 });
 $('cv').addEventListener('wheel', e => {
   e.preventDefault(); if (!meta) return;
   const p = radio('plane'), g = planeGeom(p);
-  setIdx(p, Math.max(0, Math.min(g.max, g.idx + (e.deltaY > 0 ? 1 : -1))));
+  setIdx(p, Math.max(g.min, Math.min(g.max, g.idx + (e.deltaY > 0 ? 1 : -1))));
   syncSlider(); draw();
 }, {passive: false});
 </script>
