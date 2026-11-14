@@ -55,60 +55,108 @@ const log = m => { $('log').textContent += '\n' + m; $('log').scrollTop = 1e9; }
 let py, meta = null, rois = [], cur = 0, secLoaded = false;
 
 const PY = String.raw`
-import os, json, numpy as np, pydicom
+import os, gc, json, numpy as np, pydicom
+P = None; S = None; sec_cache = {}
 
 NON_IMAGE = {'RTSTRUCT', 'REG', 'RTPLAN', 'RTDOSE', 'RTRECORD', 'SR', 'PR', 'KO'}
 
-def read_dir(d):
-    out = []
-    for f in os.listdir(d):
-        try:
-            out.append(pydicom.dcmread(os.path.join(d, f), force=True))
-        except Exception:
-            pass
-    return out
+ING, OTHER, FACTOR = {}, {}, {}
+VOXEL_BUDGET = 60_000_000      # max secondary voxels kept in memory (~240 MB float32)
 
-def build_series(dsets):
+def ingest_begin(tag, nfiles, downsample):
+    """Start streaming a series in. Files are read one at a time and deleted immediately."""
+    global P, S, sec_cache
+    S = None; sec_cache = {}
+    if tag == 'pri':
+        P = None
+    ING[tag], OTHER[tag] = [], []
+    FACTOR[tag] = dict(n=nfiles, down=bool(downsample), f=None)
+    gc.collect()
+
+def ingest(tag, path):
+    try:
+        d = pydicom.dcmread(path, force=True)
+    except Exception:
+        os.remove(path); return 'unreadable'
+    os.remove(path)
+    mod = str(getattr(d, 'Modality', ''))
+    if 'PixelData' not in d or mod in NON_IMAGE:
+        if mod in ('REG', 'RTSTRUCT'):
+            OTHER[tag].append(d)
+        return mod or 'other'
+    fc = FACTOR[tag]
+    if fc['f'] is None:
+        f = 1
+        if fc['down'] and P is not None:
+            sps = min(float(x) for x in d.PixelSpacing)
+            f = max(1, int(np.floor(min(P['ps']) / sps + 1e-6)))     # no finer than the primary grid
+            while fc['n'] * (int(d.Rows) // f) * (int(d.Columns) // f) > VOXEL_BUDGET:
+                f += 1
+        fc['f'] = f
+    f = fc['f']
+    arr = d.pixel_array
+    if arr.ndim != 2:
+        return 'multiframe-skipped'
+    arr = arr.astype(np.float32) * float(getattr(d, 'RescaleSlope', 1) or 1) + float(getattr(d, 'RescaleIntercept', 0) or 0)
+    if f > 1:
+        r, c = (arr.shape[0] // f) * f, (arr.shape[1] // f) * f
+        arr = arr[:r, :c].reshape(r // f, f, c // f, f).mean(axis=(1, 3), dtype=np.float32)
+    del d.PixelData
+    if hasattr(d, '_pixel_array'):
+        d._pixel_array = None
+    ING[tag].append((d, arr))
+    return mod
+
+def build_series(tag):
     """Pick the largest image series, sort along slice normal, build volume + voxel->patient affine."""
-    imgs = [d for d in dsets if 'PixelData' in d and getattr(d, 'Modality', '') not in NON_IMAGE]
-    if not imgs:
+    items = ING.pop(tag, [])
+    f = FACTOR[tag]['f'] or 1
+    if not items:
         raise ValueError('No image slices with pixel data found')
     groups = {}
-    for d in imgs:
-        groups.setdefault(str(getattr(d, 'SeriesInstanceUID', '')), []).append(d)
-    sl = max(groups.values(), key=len)
-    iop = np.array(sl[0].ImageOrientationPatient, float)
+    for d, a in items:
+        groups.setdefault(str(getattr(d, 'SeriesInstanceUID', '')), []).append((d, a))
+    items = None
+    sel = max(groups.values(), key=len)
+    nseries = len(groups); groups = None; gc.collect()
+    d0 = sel[0][0]
+    iop = np.array(d0.ImageOrientationPatient, float)
     row, col = iop[:3], iop[3:]
     normal = np.cross(row, col)
-    sl.sort(key=lambda d: float(np.dot(normal, np.array(d.ImagePositionPatient, float))))
-    vol = np.stack([d.pixel_array.astype(np.float32) * float(getattr(d, 'RescaleSlope', 1) or 1)
-                    + float(getattr(d, 'RescaleIntercept', 0) or 0) for d in sl])
-    ps = [float(x) for x in sl[0].PixelSpacing]   # [row spacing, col spacing]
+    sel.sort(key=lambda t: float(np.dot(normal, np.array(t[0].ImagePositionPatient, float))))
+    sl = [t[0] for t in sel]
+    vol = np.empty((len(sel),) + sel[0][1].shape, np.float32)
+    for i in range(len(sel)):
+        vol[i] = sel[i][1]; sel[i] = None
+    sel = None; gc.collect()
+    ps0 = [float(x) for x in d0.PixelSpacing]
+    ps = [ps0[0] * f, ps0[1] * f]
     pos = np.array([float(np.dot(normal, np.array(d.ImagePositionPatient, float))) for d in sl])
-    gap = float(np.median(np.diff(pos))) if len(pos) > 1 else float(getattr(sl[0], 'SliceThickness', 1) or 1)
+    gap = float(np.median(np.diff(pos))) if len(pos) > 1 else float(getattr(d0, 'SliceThickness', 1) or 1)
     A = np.eye(4)          # (col, row, slice, 1) -> patient mm
     A[:3, 0] = row * ps[1]
     A[:3, 1] = col * ps[0]
     A[:3, 2] = normal * gap
-    A[:3, 3] = np.array(sl[0].ImagePositionPatient, float)
-    d0 = sl[0]
-    info = dict(modality=str(d0.Modality), n=len(sl), rows=int(d0.Rows), cols=int(d0.Columns), ps=ps,
+    # block-averaged pixel centre sits (f-1)/2 original pixels in from the original first pixel
+    A[:3, 3] = np.array(d0.ImagePositionPatient, float) + row * ps0[1] * (f - 1) / 2 + col * ps0[0] * (f - 1) / 2
+    info = dict(modality=str(d0.Modality), n=len(sl), rows=int(vol.shape[1]), cols=int(vol.shape[2]),
+                originalRowsCols=[int(d0.Rows), int(d0.Columns)], downsample=f, ps=ps,
                 sliceGap=round(gap, 3), patient=str(getattr(d0, 'PatientID', '')),
                 series=str(getattr(d0, 'SeriesDescription', '')),
                 FoR=str(getattr(d0, 'FrameOfReferenceUID', '')),
-                seriesInFolder=len(groups), skippedFiles=len(dsets) - len(sl),
-                range=[float(vol.min()), float(vol.max())])
+                seriesInFolder=nseries, memoryMB=round(vol.nbytes / 1e6),
+                range=[float(np.nanmin(vol)), float(np.nanmax(vol))])
     return dict(slices=sl, vol=vol, row=row, col=col, normal=normal, ps=ps, pos=pos, gap=gap, A=A, info=info)
 
-def load(ct_dir, rs_path):
+def load(rs_path):
     global P, S, sec_cache
     S = None; sec_cache = {}
-    P = build_series(read_dir(ct_dir))
+    P = build_series('pri')
     sl, ps, row, col, normal, pos = P['slices'], P['ps'], P['row'], P['col'], P['normal'], P['pos']
     uid_to_idx = {d.SOPInstanceUID: i for i, d in enumerate(sl)}
     out = []
-    if rs_path:
-        rs = pydicom.dcmread(rs_path, force=True)
+    rs = pydicom.dcmread(rs_path, force=True) if rs_path else next((d for d in OTHER.get('pri', []) if d.Modality == 'RTSTRUCT'), None)
+    if rs is not None:
         names = {r.ROINumber: r.ROIName for r in rs.StructureSetROISequence}
         tol = abs(P['gap']) / 2 or 1.0
         unmatched = 0
@@ -168,15 +216,14 @@ def parse_reg(reg):
     mats.setdefault(target, np.eye(4))
     return mats, target, notes
 
-def load_secondary(sec_dir, reg_path, invert):
+def load_secondary(reg_path, invert):
     global S, sec_cache
     sec_cache = {}
-    dsets = read_dir(sec_dir)
     reg = pydicom.dcmread(reg_path, force=True) if reg_path else None
     if reg is None:   # fall back to a REG sitting in the secondary folder
-        regs = [d for d in dsets if getattr(d, 'Modality', '') == 'REG']
+        regs = [d for d in OTHER.get('sec', []) if getattr(d, 'Modality', '') == 'REG']
         reg = regs[0] if regs else None
-    S = build_series(dsets)
+    S = build_series('sec')
     fP, fS = P['info']['FoR'], S['info']['FoR']
     notes = []
     if reg is not None:
@@ -258,11 +305,20 @@ def slice_rgba(i, ww, wl, which):
   } catch (e) { log('ERROR: ' + e); }
 })();
 
-async function writeFiles(files, dir) {
-  py.FS.mkdirTree(dir);
-  let i = 0;
-  for (const f of files) py.FS.writeFile(`${dir}/f${i++}`, new Uint8Array(await f.arrayBuffer()));
-  return i;
+// Stream files into Python one at a time (each is parsed then deleted) to keep memory low
+async function ingestFiles(files, tag, downsample) {
+  py.globals.get('ingest_begin')(tag, files.length, downsample);
+  const ing = py.globals.get('ingest');
+  py.FS.mkdirTree('/data');
+  const counts = {};
+  for (let i = 0; i < files.length; i++) {
+    const p = `/data/${tag}_${i}`;
+    py.FS.writeFile(p, new Uint8Array(await files[i].arrayBuffer()));
+    const m = ing(tag, p);
+    counts[m] = (counts[m] || 0) + 1;
+    if (i % 50 === 49) { log(`  read ${i + 1} / ${files.length}`); await new Promise(r => setTimeout(r)); }
+  }
+  log('  files by type: ' + JSON.stringify(counts));
 }
 async function writeOne(file, tag) {
   if (!file) return '';
@@ -276,12 +332,11 @@ $('go').onclick = async () => {
   try {
     const ctFiles = [...$('ctDir').files, ...$('ctFiles').files];
     if (!ctFiles.length) return log('Pick CT files first.');
-    const dir = '/data/ct' + Date.now();
-    log(`Copying ${await writeFiles(ctFiles, dir)} primary files into Pyodide…`);
-    const rsPath = await writeOne($('rs').files[0], 'rs');
-    log('Parsing primary…');
     const t = performance.now();
-    const res = JSON.parse(py.globals.get('load')(dir, rsPath));
+    log(`Reading ${ctFiles.length} primary files…`);
+    await ingestFiles(ctFiles, 'pri', false);
+    const rsPath = await writeOne($('rs').files[0], 'rs');
+    const res = JSON.parse(py.globals.get('load')(rsPath));
     meta = res.info; rois = res.rois;
     log(`Primary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(meta));
     const cv = $('cv');
@@ -301,12 +356,12 @@ $('go2').onclick = async () => {
   try {
     const files = [...$('secDir').files, ...$('secFiles').files];
     if (!files.length) return log('Pick secondary image files first.');
-    const dir = '/data/sec' + Date.now();
-    log(`Copying ${await writeFiles(files, dir)} secondary files into Pyodide…`);
-    const regPath = await writeOne($('reg').files[0], 'reg');
-    log('Parsing secondary + registration…');
+    secLoaded = false; $('vsec').disabled = true; setView('pri'); draw();
     const t = performance.now();
-    const info = JSON.parse(py.globals.get('load_secondary')(dir, regPath, $('inv').checked));
+    log(`Reading ${files.length} secondary files…`);
+    await ingestFiles(files, 'sec', true);
+    const regPath = await writeOne($('reg').files[0], 'reg');
+    const info = JSON.parse(py.globals.get('load_secondary')(regPath, $('inv').checked));
     log(`Secondary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(info));
     $('sw').value = info.autoW; $('sl2').value = info.autoL;
     secLoaded = true; $('vsec').disabled = false; setView('sec');
