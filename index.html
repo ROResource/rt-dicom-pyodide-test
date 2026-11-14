@@ -7,13 +7,18 @@
 <style>
   body{font-family:system-ui,sans-serif;background:#111;color:#ddd;margin:16px}
   #wrap{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
-  canvas{background:#000;max-width:100%;image-rendering:pixelated}
-  #rois{font-size:13px;max-height:80vh;overflow:auto}
-  .sw{display:inline-block;width:10px;height:10px;margin-right:6px}
-  pre{font-size:12px;white-space:pre-wrap;color:#9c9;max-height:30vh;overflow:auto}
+  canvas{background:#000;cursor:crosshair}
+  #rois{font-size:13px;max-height:85vh;overflow:auto;min-width:320px}
+  #rois table{border-collapse:collapse}
+  #rois td{padding:1px 4px}
+  #rois input[type=text]{width:150px;background:#222;color:#ddd;border:1px solid #444}
+  #rois input[type=color]{width:28px;height:18px;padding:0;border:0;background:none}
+  #rois .renamed{border-color:#c90 !important}
+  pre{font-size:12px;white-space:pre-wrap;color:#9c9;max-height:22vh;overflow:auto}
   label{margin-right:12px}
   fieldset{border:1px solid #444;margin:0 0 10px;padding:6px 10px}
   input[type=number]{width:70px}
+  button{margin-right:4px}
 </style>
 </head>
 <body>
@@ -32,13 +37,18 @@
   <button id="go2" disabled>Load secondary</button>
 </fieldset>
 <p>
-  View: <label><input type="radio" name="view" value="pri" checked> Primary</label>
+  Plane: <label><input type="radio" name="plane" value="ax" checked> Axial</label>
+  <label><input type="radio" name="plane" value="sag"> Sagittal</label>
+  <label><input type="radio" name="plane" value="cor"> Coronal</label>
+  <small>(A / S / C)</small>
+  &nbsp;|&nbsp; Image: <label><input type="radio" name="view" value="pri" checked> Primary</label>
   <label><input type="radio" name="view" value="sec" id="vsec" disabled> Secondary</label>
-  <small>(T to toggle)</small>
-  &nbsp; Slice <input type="range" id="slice" min="0" max="0" value="0" style="width:300px"> <span id="sl"></span>
+  <small>(T)</small>
+  &nbsp;|&nbsp; <label><input type="checkbox" id="xhair" checked> crosshair</label>
 </p>
 <p>
-  CT W/L: <select id="wl">
+  Slice <input type="range" id="slice" min="0" max="0" value="0" style="width:300px"> <span id="sl"></span>
+  &nbsp; CT W/L: <select id="wl">
     <option value="400,40">Soft tissue 400/40</option>
     <option value="1600,-600">Lung 1600/-600</option>
     <option value="2000,300">Bone 2000/300</option>
@@ -46,17 +56,24 @@
   &nbsp; Secondary W <input type="number" id="sw"> L <input type="number" id="sl2">
 </p>
 <pre id="log">Loading Pyodide…</pre>
-<div id="wrap"><canvas id="cv"></canvas><div id="rois"></div></div>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="rois"></div>
+</div>
 
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <script src="https://cdn.jsdelivr.net/pyodide/v0.29.0/full/pyodide.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const log = m => { $('log').textContent += '\n' + m; $('log').scrollTop = 1e9; };
-let py, meta = null, rois = [], cur = 0, secLoaded = false;
+let py, meta = null, rois = [], secLoaded = false;
+let pos = {k: 0, r: 0, c: 0};          // cursor in primary voxel indices (slice, row, col)
+let lineWidth = 1.5;
+const off = document.createElement('canvas');   // native-resolution image, scaled onto the visible canvas
 
 const PY = String.raw`
 import os, gc, json, numpy as np, pydicom
-P = None; S = None; sec_cache = {}
+P = None; S = None; RS = None; sec_cache = {}
 
 NON_IMAGE = {'RTSTRUCT', 'REG', 'RTPLAN', 'RTDOSE', 'RTRECORD', 'SR', 'PR', 'KO'}
 
@@ -153,13 +170,14 @@ def build_series(tag):
     return dict(slices=sl, vol=vol, row=row, col=col, normal=normal, ps=ps, pos=pos, gap=gap, A=A, info=info)
 
 def load(rs_path):
-    global P, S, sec_cache
+    global P, S, RS, sec_cache
     S = None; sec_cache = {}
     P = build_series('pri')
     sl, ps, row, col, normal, pos = P['slices'], P['ps'], P['row'], P['col'], P['normal'], P['pos']
     uid_to_idx = {d.SOPInstanceUID: i for i, d in enumerate(sl)}
     out = []
     rs = pydicom.dcmread(rs_path, force=True) if rs_path else next((d for d in OTHER.get('pri', []) if d.Modality == 'RTSTRUCT'), None)
+    RS = rs
     if rs is not None:
         names = {r.ROINumber: r.ROIName for r in rs.StructureSetROISequence}
         tol = abs(P['gap']) / 2 or 1.0
@@ -187,7 +205,7 @@ def load(rs_path):
                 x = rel @ row / ps[1]
                 y = rel @ col / ps[0]
                 per_slice.setdefault(idx, []).append(np.column_stack([x, y]).ravel().round(2).tolist())
-            out.append(dict(name=str(names.get(num, f'ROI {num}')), color=color,
+            out.append(dict(number=int(num), name=str(names.get(num, f'ROI {num}')), color=color,
                             nContours=sum(len(v) for v in per_slice.values()), nPoints=npts, slices=per_slice))
         P['info']['unmatchedContours'] = unmatched
     return json.dumps(dict(info=P['info'], rois=out))
@@ -253,20 +271,35 @@ def load_secondary(reg_path, invert):
     return json.dumps(info)
 
 _grid = {}
-def sec_slice(i):
-    """Resample the secondary volume onto primary slice i (trilinear, 0 outside)."""
-    i = int(i)
-    if i in sec_cache:
-        return sec_cache[i]
-    rows, cols = P['info']['rows'], P['info']['cols']
-    key = (rows, cols)
-    if key not in _grid:
-        rr, cc = np.mgrid[0:rows, 0:cols]
-        _grid[key] = np.stack([cc.ravel(), rr.ravel(), np.zeros(rows * cols), np.ones(rows * cols)]).astype(np.float64)
-    Ai = P['A'].copy()
-    Ai[:3, 3] = np.array(P['slices'][i].ImagePositionPatient, float)
-    K = S['Ainv'] @ S['T'] @ Ai                    # primary (c, r, 0) -> secondary (c, r, k)
-    c, r, k = (K @ _grid[key])[:3]
+def plane_shape(view):
+    n, rows, cols = P['vol'].shape
+    return {'ax': (rows, cols), 'sag': (n, rows), 'cor': (n, cols)}[view]
+
+def sec_plane(view, i):
+    """Resample the secondary onto a primary plane (trilinear, NaN outside).
+    ax: (rows, cols) at slice i; sag: (n, rows) at column i; cor: (n, cols) at row i.
+    Sag/cor are returned superior-at-top (slice order flipped)."""
+    i = int(i); key = (view, i)
+    if key in sec_cache:
+        return sec_cache[key]
+    h, w = plane_shape(view)
+    gk = (view, h, w)
+    if gk not in _grid:
+        yy, xx = np.mgrid[0:h, 0:w]
+        _grid[gk] = (yy.ravel().astype(np.float64), xx.ravel().astype(np.float64))
+    yy, xx = _grid[gk]
+    one = np.ones_like(xx)
+    n = P['vol'].shape[0]
+    Ap = P['A'].copy()
+    if view == 'ax':
+        Ap[:3, 3] = np.array(P['slices'][i].ImagePositionPatient, float)
+        pts = np.stack([xx, yy, 0 * one, one])
+    elif view == 'sag':
+        pts = np.stack([i * one, xx, (n - 1) - yy, one])
+    else:
+        pts = np.stack([xx, i * one, (n - 1) - yy, one])
+    K = S['Ainv'] @ S['T'] @ Ap                    # primary voxel -> secondary voxel
+    c, r, k = (K @ pts)[:3]
     vol = S['vol']; nk, nr, nc = vol.shape
     c0, r0, k0 = np.floor(c).astype(int), np.floor(r).astype(int), np.floor(k).astype(int)
     fc, fr, fk = c - c0, r - r0, k - k0
@@ -280,21 +313,51 @@ def sec_slice(i):
            (g(k0, r0 + 1, c0) * (1 - fc) + g(k0, r0 + 1, c0 + 1) * fc) * fr) * (1 - fk) + \
           ((g(k1, r0, c0) * (1 - fc) + g(k1, r0, c0 + 1) * fc) * (1 - fr) +
            (g(k1, r0 + 1, c0) * (1 - fc) + g(k1, r0 + 1, c0 + 1) * fc) * fr) * fk
-    out = np.where(ok, val, np.nan).reshape(rows, cols).astype(np.float32)
-    if len(sec_cache) > 40:
+    out = np.where(ok, val, np.nan).reshape(h, w).astype(np.float32)
+    if len(sec_cache) > 60:
         sec_cache.clear()
-    sec_cache[i] = out
+    sec_cache[key] = out
     return out
 
-def slice_rgba(i, ww, wl, which):
-    a = sec_slice(i) if which == 'sec' else P['vol'][int(i)]
+def pri_plane(view, i):
+    v = P['vol']; i = int(i)
+    if view == 'ax':
+        return v[i]
+    if view == 'sag':
+        return v[::-1, :, i]
+    return v[::-1, i, :]
+
+def plane_rgba(view, i, ww, wl, which):
+    a = sec_plane(view, i) if which == 'sec' else pri_plane(view, i)
     lo = wl - ww / 2
-    g = np.clip((np.nan_to_num(a, nan=-1e9) - lo) / max(ww, 1e-6) * 255, 0, 255).astype(np.uint8)
+    g = np.clip((np.nan_to_num(np.asarray(a, np.float32), nan=-1e9) - lo) / max(ww, 1e-6) * 255, 0, 255).astype(np.uint8)
     rgba = np.empty(g.shape + (4,), np.uint8)
     rgba[..., 0] = g; rgba[..., 1] = g; rgba[..., 2] = g; rgba[..., 3] = 255
-    if which == 'sec':   # tint outside-of-secondary area dark blue so the coverage is visible
+    if which == 'sec':   # tint area outside the secondary dark blue so coverage is visible
         m = np.isnan(a); rgba[m, 0] = 0; rgba[m, 1] = 0; rgba[m, 2] = 40
-    return rgba.tobytes()
+    return np.frombuffer(rgba.tobytes(), np.uint8)
+
+def export_rs(edits_json):
+    """Apply renamed ROI names/colours to a copy of the RTSTRUCT and return the file bytes."""
+    import copy, io
+    from pydicom.uid import generate_uid
+    if RS is None:
+        raise ValueError('No RTSTRUCT loaded')
+    ds = copy.deepcopy(RS)
+    edits = {int(e['number']): e for e in json.loads(edits_json)}
+    for r in ds.StructureSetROISequence:
+        if int(r.ROINumber) in edits:
+            r.ROIName = edits[int(r.ROINumber)]['name'][:64]
+    for rc in ds.ROIContourSequence:
+        if int(rc.ReferencedROINumber) in edits:
+            rc.ROIDisplayColor = [int(x) for x in edits[int(rc.ReferencedROINumber)]['color']]
+    new_uid = generate_uid()
+    ds.SOPInstanceUID = new_uid
+    if hasattr(ds, 'file_meta'):
+        ds.file_meta.MediaStorageSOPInstanceUID = new_uid
+    buf = io.BytesIO()
+    ds.save_as(buf, enforce_file_format=False)
+    return np.frombuffer(buf.getvalue(), np.uint8)
 `;
 
 (async () => {
@@ -332,6 +395,9 @@ async function writeOne(file, tag) {
   return p;
 }
 
+const hex = c => '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
+const unhex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+
 $('go').onclick = async () => {
   try {
     const ctFiles = [...$('ctDir').files, ...$('ctFiles').files];
@@ -341,18 +407,15 @@ $('go').onclick = async () => {
     await ingestFiles(ctFiles, 'pri', false);
     const rsPath = await writeOne($('rs').files[0], 'rs');
     const res = JSON.parse(py.globals.get('load')(rsPath));
-    meta = res.info; rois = res.rois;
+    meta = res.info;
+    rois = res.rois.map(r => ({...r, origName: r.name, visible: true,
+      ks: Object.keys(r.slices).map(Number).sort((a, b) => a - b)}));
     log(`Primary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(meta));
-    const cv = $('cv');
-    cv.width = meta.cols; cv.height = meta.rows;
-    cv.style.width = 'min(90vw, 640px)';
-    cv.style.aspectRatio = (meta.cols * meta.ps[1]) + ' / ' + (meta.rows * meta.ps[0]);
-    $('slice').max = meta.n - 1; cur = Math.floor(meta.n / 2); $('slice').value = cur;
-    $('rois').innerHTML = '<b>' + rois.length + ' structures</b><br>' + rois.map(r =>
-      `<div><span class="sw" style="background:rgb(${r.color})"></span>${r.name} <small>(${r.nContours} contours, ${r.nPoints} pts)</small></div>`).join('');
-    secLoaded = false; $('vsec').disabled = true; setView('pri');
+    pos = {k: Math.floor(meta.n / 2), r: Math.floor(meta.rows / 2), c: Math.floor(meta.cols / 2)};
+    buildRoiPanel();
+    secLoaded = false; $('vsec').disabled = true; setRadio('view', 'pri');
     $('go2').disabled = false;
-    draw();
+    syncSlider(); draw();
   } catch (e) { log('ERROR: ' + e); console.error(e); }
 };
 
@@ -360,7 +423,7 @@ $('go2').onclick = async () => {
   try {
     const files = [...$('secDir').files, ...$('secFiles').files];
     if (!files.length) return log('Pick secondary image files first.');
-    secLoaded = false; $('vsec').disabled = true; setView('pri'); draw();
+    secLoaded = false; $('vsec').disabled = true; setRadio('view', 'pri'); draw();
     const t = performance.now();
     log(`Reading ${files.length} secondary files…`);
     await ingestFiles(files, 'sec', true);
@@ -368,49 +431,199 @@ $('go2').onclick = async () => {
     const info = JSON.parse(py.globals.get('load_secondary')(regPath, $('inv').checked));
     log(`Secondary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(info));
     $('sw').value = info.autoW; $('sl2').value = info.autoL;
-    secLoaded = true; $('vsec').disabled = false; setView('sec');
+    secLoaded = true; $('vsec').disabled = false; setRadio('view', 'sec');
     draw();
   } catch (e) { log('ERROR: ' + e); console.error(e); }
 };
 
-function view() { return document.querySelector('input[name=view]:checked').value; }
-function setView(v) { document.querySelector(`input[name=view][value=${v}]`).checked = true; }
+// ---------- structure panel ----------
+function buildRoiPanel() {
+  const el = $('rois');
+  el.innerHTML = `<b>${rois.length} structures</b><br>
+    <button id="allOn">All on</button><button id="allOff">All off</button>
+    &nbsp; Line width <input type="range" id="lw" min="0.5" max="5" step="0.5" value="${lineWidth}" style="width:90px"> <span id="lwv">${lineWidth}</span><br>
+    <button id="exp" ${rois.length ? '' : 'disabled'}>Download renamed RTSTRUCT</button>
+    <table>${rois.map((r, i) => `<tr>
+      <td><input type="checkbox" data-i="${i}" class="vis" checked></td>
+      <td><input type="color" data-i="${i}" class="col" value="${hex(r.color)}"></td>
+      <td><input type="text" data-i="${i}" class="nm" value="${r.name.replace(/"/g, '&quot;')}" title="Original: ${r.origName.replace(/"/g, '&quot;')}"></td>
+      <td><small>${r.nContours} contours</small></td>
+      <td><button data-i="${i}" class="go" title="Jump to centre slice">&#8982;</button></td></tr>`).join('')}</table>`;
+  el.querySelectorAll('.vis').forEach(x => x.onchange = e => { rois[+e.target.dataset.i].visible = e.target.checked; draw(); });
+  el.querySelectorAll('.col').forEach(x => x.oninput = e => { rois[+e.target.dataset.i].color = unhex(e.target.value); draw(); });
+  el.querySelectorAll('.nm').forEach(x => x.oninput = e => {
+    const r = rois[+e.target.dataset.i]; r.name = e.target.value;
+    e.target.classList.toggle('renamed', r.name !== r.origName);
+  });
+  el.querySelectorAll('.go').forEach(x => x.onclick = e => {
+    const r = rois[+e.target.dataset.i]; if (!r.ks.length) return;
+    const k = r.ks[Math.floor(r.ks.length / 2)];
+    const pts = r.slices[k].flat(); let sx = 0, sy = 0;
+    for (let j = 0; j < pts.length; j += 2) { sx += pts[j]; sy += pts[j + 1]; }
+    pos = {k, c: Math.round(sx / (pts.length / 2)), r: Math.round(sy / (pts.length / 2))};
+    syncSlider(); draw();
+  });
+  $('allOn').onclick = () => setAll(true); $('allOff').onclick = () => setAll(false);
+  $('lw').oninput = e => { lineWidth = +e.target.value; $('lwv').textContent = lineWidth; draw(); };
+  $('exp').onclick = exportRs;
+}
+function setAll(v) { rois.forEach(r => r.visible = v); $('rois').querySelectorAll('.vis').forEach(x => x.checked = v); draw(); }
+
+function exportRs() {
+  try {
+    const edits = rois.map(r => ({number: r.number, name: r.name, color: r.color}));
+    const proxy = py.globals.get('export_rs')(JSON.stringify(edits));
+    const bytes = proxy.toJs(); proxy.destroy();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([bytes], {type: 'application/dicom'}));
+    a.download = 'RS_renamed.dcm'; a.click();
+    const n = rois.filter(r => r.name !== r.origName).length;
+    log(`Exported RTSTRUCT with ${n} renamed structure(s) and a new SOP Instance UID.`);
+  } catch (e) { log('ERROR: ' + e); }
+}
+
+// ---------- planes ----------
+const radio = n => document.querySelector(`input[name=${n}]:checked`).value;
+const setRadio = (n, v) => { document.querySelector(`input[name=${n}][value=${v}]`).checked = true; };
+
+// image size (native px) and physical size (mm) of each plane
+function planeGeom(p) {
+  const {n, rows, cols, ps} = meta, gap = Math.abs(meta.sliceGap) || 1;
+  if (p === 'ax')  return {w: cols, h: rows, mmW: cols * ps[1], mmH: rows * ps[0], max: n - 1, idx: pos.k};
+  if (p === 'sag') return {w: rows, h: n, mmW: rows * ps[0], mmH: n * gap, max: cols - 1, idx: pos.c};
+  return               {w: cols, h: n, mmW: cols * ps[1], mmH: n * gap, max: rows - 1, idx: pos.r};
+}
+function setIdx(p, v) { if (p === 'ax') pos.k = v; else if (p === 'sag') pos.c = v; else pos.r = v; }
+function syncSlider() {
+  if (!meta) return;
+  const g = planeGeom(radio('plane'));
+  $('slice').max = g.max; $('slice').value = g.idx;
+}
+
+// Structure outline in a sagittal/coronal plane: rasterise each axial contour's crossings with the
+// plane line (even-odd), then trace the resulting 2D mask with d3.contours.
+function reslicedOutline(r, p, idx, g) {
+  if (!r.ks.length) return null;
+  const n = meta.n, W = g.w, H = g.h;
+  const kmin = r.ks[0], kmax = r.ks[r.ks.length - 1];
+  const y0 = (n - 1) - kmax, y1 = (n - 1) - kmin;     // display rows touched
+  const bh = y1 - y0 + 3;                               // 1-row padding each side
+  const grid = new Float32Array(W * bh);
+  let any = false;
+  const L = idx;                                        // line position (pixel-centre coords)
+  for (const k of r.ks) {
+    const xs = [];
+    for (const poly of r.slices[k]) {
+      const m = poly.length;
+      for (let j = 0; j < m; j += 2) {
+        const ax = poly[j], ay = poly[j + 1], bx = poly[(j + 2) % m], by = poly[(j + 3) % m];
+        // sag: line x = L, crossing gives y (row); cor: line y = L, crossing gives x (col)
+        const [u0, v0, u1, v1] = p === 'sag' ? [ax, ay, bx, by] : [ay, ax, by, bx];
+        if ((u0 <= L) !== (u1 <= L)) xs.push(v0 + (L - u0) / (u1 - u0) * (v1 - v0));
+      }
+    }
+    if (xs.length < 2) continue;
+    xs.sort((a, b) => a - b);
+    const row = ((n - 1) - k) - y0 + 1;
+    for (let j = 0; j + 1 < xs.length; j += 2) {
+      const a = Math.max(0, Math.ceil(xs[j])), b = Math.min(W - 1, Math.floor(xs[j + 1]));
+      for (let x = a; x <= b; x++) { grid[row * W + x] = 1; any = true; }
+    }
+  }
+  if (!any) return null;
+  const mp = d3.contours().size([W, bh]).thresholds([0.5])(grid)[0];
+  return {mp, yoff: y0 - 1};
+}
 
 function draw() {
   if (!meta) return;
-  const which = secLoaded && view() === 'sec' ? 'sec' : 'pri';
+  const p = radio('plane'), g = planeGeom(p);
+  const which = secLoaded && radio('view') === 'sec' ? 'sec' : 'pri';
   const [ww, wl] = which === 'sec' ? [+$('sw').value, +$('sl2').value] : $('wl').value.split(',').map(Number);
-  const proxy = py.globals.get('slice_rgba')(cur, ww, wl, which);
+  const proxy = py.globals.get('plane_rgba')(p, g.idx, ww, wl, which);
   const buf = proxy.toJs(); proxy.destroy();
-  const ctx = $('cv').getContext('2d');
-  ctx.putImageData(new ImageData(new Uint8ClampedArray(buf.buffer, buf.byteOffset, buf.length), meta.cols, meta.rows), 0, 0);
-  ctx.lineWidth = 1;
+  off.width = g.w; off.height = g.h;
+  off.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(buf.buffer, buf.byteOffset, buf.length), g.w, g.h), 0, 0);
+
+  // visible canvas: physical aspect ratio, device-pixel sharp
+  const dpr = window.devicePixelRatio || 1;
+  const maxW = Math.min(window.innerWidth - 380, 760), maxH = window.innerHeight * 0.8;
+  const scale = Math.min(maxW / g.mmW, maxH / g.mmH);
+  const cssW = Math.round(g.mmW * scale), cssH = Math.round(g.mmH * scale);
+  const cv = $('cv');
+  cv.style.width = cssW + 'px'; cv.style.height = cssH + 'px';
+  cv.width = cssW * dpr; cv.height = cssH * dpr;
+  const ctx = cv.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(off, 0, 0, cv.width, cv.height);
+  const sx = cv.width / g.w, sy = cv.height / g.h;     // native image px -> canvas px
+  ctx.lineWidth = lineWidth * dpr; ctx.lineJoin = 'round';
+
   for (const r of rois) {
-    const cs = r.slices[cur]; if (!cs) continue;
+    if (!r.visible) continue;
     ctx.strokeStyle = `rgb(${r.color})`;
-    for (const c of cs) {
-      ctx.beginPath(); ctx.moveTo(c[0], c[1]);
-      for (let k = 2; k < c.length; k += 2) ctx.lineTo(c[k], c[k+1]);
-      ctx.closePath(); ctx.stroke();
+    if (p === 'ax') {
+      const cs = r.slices[pos.k]; if (!cs) continue;
+      for (const c of cs) {
+        ctx.beginPath(); ctx.moveTo((c[0] + .5) * sx, (c[1] + .5) * sy);
+        for (let k = 2; k < c.length; k += 2) ctx.lineTo((c[k] + .5) * sx, (c[k + 1] + .5) * sy);
+        ctx.closePath(); ctx.stroke();
+      }
+    } else {
+      const o = reslicedOutline(r, p, g.idx, g); if (!o) continue;
+      ctx.beginPath();
+      for (const poly of o.mp.coordinates) for (const ring of poly) {
+        ring.forEach(([x, y], j) => { const X = x * sx, Y = (y + o.yoff) * sy; j ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
+        ctx.closePath();
+      }
+      ctx.stroke();
     }
   }
-  ctx.fillStyle = '#ff0'; ctx.font = '12px system-ui';
-  ctx.fillText(which === 'sec' ? 'SECONDARY (registered)' : 'PRIMARY', 6, 16);
-  $('sl').textContent = `${cur + 1} / ${meta.n}`;
+
+  if ($('xhair').checked) {      // crosshair = position of the other two planes
+    const n = meta.n;
+    const [cx, cy] = p === 'ax' ? [pos.c, pos.r] : p === 'sag' ? [pos.r, (n - 1) - pos.k] : [pos.c, (n - 1) - pos.k];
+    ctx.save(); ctx.strokeStyle = 'rgba(255,255,0,.45)'; ctx.lineWidth = dpr; ctx.setLineDash([4 * dpr, 4 * dpr]);
+    ctx.beginPath(); ctx.moveTo((cx + .5) * sx, 0); ctx.lineTo((cx + .5) * sx, cv.height);
+    ctx.moveTo(0, (cy + .5) * sy); ctx.lineTo(cv.width, (cy + .5) * sy); ctx.stroke(); ctx.restore();
+  }
+  ctx.fillStyle = '#ff0'; ctx.font = `${12 * dpr}px system-ui`;
+  const names = {ax: 'AXIAL', sag: 'SAGITTAL', cor: 'CORONAL'};
+  ctx.fillText(`${names[p]} · ${which === 'sec' ? 'SECONDARY (registered)' : 'PRIMARY'}`, 6 * dpr, 16 * dpr);
+  const lab = p === 'ax' ? ['R', 'L', 'A', 'P'] : p === 'sag' ? ['A', 'P', 'S', 'I'] : ['R', 'L', 'S', 'I'];
+  ctx.fillText(lab[0], 6 * dpr, cv.height / 2); ctx.fillText(lab[1], cv.width - 14 * dpr, cv.height / 2);
+  ctx.fillText(lab[2], cv.width / 2, 30 * dpr); ctx.fillText(lab[3], cv.width / 2, cv.height - 6 * dpr);
+  $('sl').textContent = `${g.idx + 1} / ${g.max + 1}`;
 }
 
-$('slice').oninput = e => { cur = +e.target.value; draw(); };
-$('wl').onchange = draw; $('sw').oninput = draw; $('sl2').oninput = draw;
+// click = move the crosshair (sets position for the other two planes)
+$('cv').addEventListener('click', e => {
+  if (!meta) return;
+  const p = radio('plane'), g = planeGeom(p), rect = e.target.getBoundingClientRect();
+  const x = Math.max(0, Math.min(g.w - 1, Math.floor((e.clientX - rect.left) / rect.width * g.w)));
+  const y = Math.max(0, Math.min(g.h - 1, Math.floor((e.clientY - rect.top) / rect.height * g.h)));
+  const k = (meta.n - 1) - y;
+  if (p === 'ax') { pos.c = x; pos.r = y; }
+  else if (p === 'sag') { pos.r = x; pos.k = k; }
+  else { pos.c = x; pos.k = k; }
+  draw();
+});
+$('slice').oninput = e => { setIdx(radio('plane'), +e.target.value); draw(); };
+$('wl').onchange = draw; $('sw').oninput = draw; $('sl2').oninput = draw; $('xhair').onchange = draw;
 document.querySelectorAll('input[name=view]').forEach(r => r.onchange = draw);
+document.querySelectorAll('input[name=plane]').forEach(r => r.onchange = () => { syncSlider(); draw(); });
+window.addEventListener('resize', draw);
 document.addEventListener('keydown', e => {
-  if ((e.key === 't' || e.key === 'T') && secLoaded && e.target.tagName !== 'INPUT') {
-    setView(view() === 'sec' ? 'pri' : 'sec'); draw();
-  }
+  if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+  const k = e.key.toLowerCase();
+  if (k === 't' && secLoaded) { setRadio('view', radio('view') === 'sec' ? 'pri' : 'sec'); draw(); }
+  if (k === 'a' || k === 's' || k === 'c') { setRadio('plane', {a: 'ax', s: 'sag', c: 'cor'}[k]); syncSlider(); draw(); }
 });
 $('cv').addEventListener('wheel', e => {
   e.preventDefault(); if (!meta) return;
-  cur = Math.max(0, Math.min(meta.n - 1, cur + (e.deltaY > 0 ? 1 : -1)));
-  $('slice').value = cur; draw();
+  const p = radio('plane'), g = planeGeom(p);
+  setIdx(p, Math.max(0, Math.min(g.max, g.idx + (e.deltaY > 0 ? 1 : -1))));
+  syncSlider(); draw();
 }, {passive: false});
 </script>
 </body>
