@@ -6,6 +6,10 @@ const PNAME = {ax: 'Axial', sag: 'Sagittal', cor: 'Coronal'};
 let atlas = null;            // config, persisted between openings
 let thumbImgs = {};          // plane -> canvas with the base image for the VOI editor
 let voiDrag = null;
+// every page is A4 landscape; image area = page minus margins/header/footer
+const PG = {W: 297, H: 210, M: 5, HEAD: 17, FOOT: 15};
+const IMG_ASPECT = (PG.H - PG.HEAD - PG.FOOT) / (PG.W - 2 * PG.M);   // max height/width that fills the page
+let projCache = {key: '', cv: {}};
 
 // ---------- config ----------
 function atlasSync() {
@@ -14,13 +18,13 @@ function atlasSync() {
     const gap = Math.abs(meta.sliceGap) || 1;
     atlas = {
       title: '', creator: '',
-      voi: {ax: {...c}, sag: {...c}, cor: {...c}}, edit: 'ax',
+      voi: {ax: {...c}, sag: {...c}, cor: {...c}}, edit: 'ax', fresh: true,
       planeOn: {ax: true, sag: true, cor: true},
       // default ~3 mm between pages to keep the PDF manageable; set to 1 for every slice
       step: {ax: Math.max(1, Math.round(3 / gap)), sag: Math.max(1, Math.round(3 / meta.ps[1])), cor: Math.max(1, Math.round(3 / meta.ps[0]))},
       scans: [], roiOn: {}, notesOn: true,
       legend: {on: false, onlyDescribed: false, desc: {}},
-      quality: 1600,
+      quality: 1200,
     };
   }
   // scans: primary, extra CT windows, then loaded secondaries (keep existing settings)
@@ -33,6 +37,42 @@ function atlasSync() {
   atlas.scans = list;
   // structures: default = currently visible
   rois.forEach(r => { if (!(r.number in atlas.roiOn)) atlas.roiOn[r.number] = r.visible; });
+  if (atlas.fresh) { atlas.fresh = false; fitAspect('sag', atlas.voi.sag); fitAspect('cor', atlas.voi.cor); }
+}
+// sagittal/coronal boxes: limit the superior-inferior extent so the image fills a landscape page.
+// mode: 't' keep bottom, 'b' keep top, otherwise centre on the selected structures (or the box)
+function fitAspect(p, v, mode) {
+  if (p === 'ax') return v;
+  const gap = Math.abs(meta.sliceGap) || 1, W = p === 'sag' ? 'r' : 'c', psW = p === 'sag' ? meta.ps[0] : meta.ps[1];
+  if (!mode) {
+    // default: widen the box (up to the full scan) so the selected structures + margin fit in height
+    let lo = Infinity, hi = -Infinity;
+    for (const r of rois) if (atlas.roiOn[r.number] && r.ks.length) { lo = Math.min(lo, r.ks[0]); hi = Math.max(hi, r.ks[r.ks.length - 1]); }
+    if (isFinite(lo)) {
+      const m = Math.round((+$('cropMargin').value || 0) / gap);
+      const needK = Math.min(v.k1, hi + m) - Math.max(v.k0, lo - m) + 1;
+      const needW = Math.ceil(needK * gap / IMG_ASPECT / psW), haveW = v[W + '1'] - v[W + '0'] + 1;
+      const full = (W === 'r' ? meta.rows : meta.cols);
+      if (needW > haveW) {
+        const w = Math.min(full, needW), mid = (v[W + '0'] + v[W + '1']) / 2;
+        v[W + '0'] = Math.max(0, Math.min(full - w, Math.round(mid - w / 2))); v[W + '1'] = v[W + '0'] + w - 1;
+      }
+    }
+  }
+  const wMm = (v[W + '1'] - v[W + '0'] + 1) * psW;
+  const maxK = Math.max(4, Math.floor(wMm * IMG_ASPECT / gap));
+  if (v.k1 - v.k0 + 1 <= maxK) return v;
+  if (mode === 't') v.k1 = v.k0 + maxK - 1;
+  else if (mode === 'b') v.k0 = v.k1 - maxK + 1;
+  else if (mode === 'keep') { const mid = (v.k0 + v.k1) / 2; v.k0 = Math.max(0, Math.round(mid - maxK / 2)); v.k1 = Math.min(meta.n - 1, v.k0 + maxK - 1); }
+  else {
+    let lo = Infinity, hi = -Infinity;
+    for (const r of rois) if (atlas.roiOn[r.number] && r.ks.length) { lo = Math.min(lo, r.ks[0]); hi = Math.max(hi, r.ks[r.ks.length - 1]); }
+    let mid = isFinite(lo) ? (lo + hi) / 2 : (v.k0 + v.k1) / 2;
+    mid = Math.max(v.k0 + maxK / 2, Math.min(v.k1 - maxK / 2, mid));   // stay inside the current range
+    v.k0 = Math.max(0, Math.round(mid - maxK / 2)); v.k1 = Math.min(meta.n - 1, v.k0 + maxK - 1);
+  }
+  return v;
 }
 const atlasName = s => s.kind === 'win' ? s.name : scanName(s.key);
 function setAtlasName(s, v) {
@@ -98,10 +138,11 @@ function atlasRender() {
 
   <h4>Planes and volume of interest</h4>
   Each plane has its own box. Pick which one to edit, then drag inside a box to move it or drag its edges to resize, on any of the three views.
-  <table style="margin-top:6px"><tr><th>Edit</th><th>Plane</th><th>Include</th><th>Every Nth slice</th><th>Spacing</th><th>Pages per scan</th><th></th></tr>
+  Shaded areas show the full extent of the selected structures. Sagittal and coronal boxes are limited in height so the image fills a landscape A4 page (widen the box to allow more height).
+  Which planes are built is set per scan below.
+  <table style="margin-top:6px"><tr><th>Edit</th><th>Plane</th><th>Every Nth slice</th><th>Spacing</th><th>Pages per scan</th><th></th></tr>
   ${APLANES.map(p => `<tr>
     <td><input type="radio" name="voiEdit" value="${p}" ${A.edit === p ? 'checked' : ''}></td><td>${PNAME[p]}</td>
-    <td><input type="checkbox" class="aPlane" data-p="${p}" ${A.planeOn[p] ? 'checked' : ''}></td>
     <td><input type="number" class="aStep" data-p="${p}" min="1" max="50" value="${A.step[p]}"></td>
     <td id="aSp_${p}">${spacingMm(p).toFixed(1)} mm</td><td id="aPg_${p}">${sliceList(p).length}</td><td id="aNs_${p}" style="color:#ffd400"></td></tr>`).join('')}
   </table>
@@ -109,7 +150,7 @@ function atlasRender() {
   <div class="thumbs">${APLANES.map(p => `<div><canvas id="aTh_${p}"></canvas><br>${PNAME[p]}</div>`).join('')}</div>
 
   <h4>Scans</h4>
-  <table><tr><th>Include</th><th>Name in atlas</th><th>Type</th><th>W</th><th>L</th><th>Axial</th><th>Sagittal</th><th>Coronal</th><th></th></tr>
+  <table><tr><th>Include</th><th>Name in atlas</th><th>Type</th><th>W</th><th>L</th>${APLANES.map(p => `<th><label title="All scans"><input type="checkbox" class="aPlaneAll" data-p="${p}" ${A.scans.every(s => s.planes[p]) ? 'checked' : ''}> ${PNAME[p]}</label></th>`).join('')}<th></th></tr>
   ${A.scans.map((s, i) => `<tr>
     <td><input type="checkbox" class="aScan" data-i="${i}" ${s.include ? 'checked' : ''}></td>
     <td><input type="text" class="aScanName" data-i="${i}" value="${esc(atlasName(s))}" style="width:200px"></td>
@@ -139,7 +180,8 @@ function atlasRender() {
   </div>
 
   <h4>Output</h4>
-  Image resolution (long side): <select id="aQ">${[1200, 1600, 2200].map(q => `<option ${A.quality === q ? 'selected' : ''}>${q}</option>`).join('')}</select> px
+  Image resolution (image width): <select id="aQ">${[800, 1000, 1200, 1600, 2200].map(q => `<option ${A.quality === q ? 'selected' : ''}>${q}</option>`).join('')}</select> px
+  <small style="color:#999">The CT itself is only ~300–500 px across the crop, so above ~1200 px only contour lines and note text get sharper.</small>
   <div class="foot">
     <span id="aSummary"></span><br>
     <button id="aBuild" style="font-weight:bold">Build PDF</button> <button id="aClose">Close</button>
@@ -150,15 +192,15 @@ function atlasRender() {
   $('aTitle').oninput = e => A.title = e.target.value;
   $('aCreator').oninput = e => A.creator = e.target.value;
   q('input[name=voiEdit]').forEach(x => x.onchange = e => { A.edit = e.target.value; refreshThumbImgs(); });
-  q('.aPlane').forEach(x => x.onchange = e => { A.planeOn[e.target.dataset.p] = e.target.checked; atlasSummary(); });
+  q('.aPlaneAll').forEach(x => x.onchange = e => { A.scans.forEach(s => s.planes[e.target.dataset.p] = e.target.checked); atlasRender(); });
   q('.aStep').forEach(x => x.oninput = e => { A.step[e.target.dataset.p] = Math.max(1, +e.target.value | 0); atlasCounts(); });
-  $('aVoiReset').onclick = () => { A.voi[A.edit] = {...(crop || fullCrop())}; refreshThumbImgs(); atlasCounts(); };
-  $('aVoiCopy').onclick = () => { const v = A.voi[A.edit]; APLANES.forEach(p => A.voi[p] = {...v}); atlasCounts(); };
+  $('aVoiReset').onclick = () => { A.voi[A.edit] = fitAspect(A.edit, {...(crop || fullCrop())}); refreshThumbImgs(); atlasCounts(); };
+  $('aVoiCopy').onclick = () => { const v = A.voi[A.edit]; APLANES.forEach(p => A.voi[p] = fitAspect(p, {...v})); atlasCounts(); };
   q('.aScan').forEach(x => x.onchange = e => { A.scans[+e.target.dataset.i].include = e.target.checked; atlasSummary(); });
   q('.aScanName').forEach(x => x.oninput = e => setAtlasName(A.scans[+e.target.dataset.i], e.target.value));
   q('.aWW').forEach(x => x.oninput = e => A.scans[+e.target.dataset.i].ww = +e.target.value);
   q('.aWL').forEach(x => x.oninput = e => A.scans[+e.target.dataset.i].wl = +e.target.value);
-  q('.aSP').forEach(x => x.onchange = e => { A.scans[+e.target.dataset.i].planes[e.target.dataset.p] = e.target.checked; atlasSummary(); });
+  q('.aSP').forEach(x => x.onchange = e => { A.scans[+e.target.dataset.i].planes[e.target.dataset.p] = e.target.checked; atlasRender(); });
   q('.aRmWin').forEach(x => x.onclick = e => { A.scans.splice(+e.target.dataset.i, 1); atlasRender(); });
   $('aAddWin').onclick = () => {
     const [name, ww, wl] = $('aWinPreset').value.split('|');
@@ -170,7 +212,7 @@ function atlasRender() {
   };
   const setRois = f => { rois.forEach(r => A.roiOn[r.number] = f(r)); atlasRender(); };
   $('aRoiAll').onclick = () => setRois(() => true); $('aRoiNone').onclick = () => setRois(() => false); $('aRoiVis').onclick = () => setRois(r => r.visible);
-  q('.aRoi').forEach(x => x.onchange = e => { A.roiOn[+e.target.dataset.n] = e.target.checked; atlasRender(); });
+  q('.aRoi').forEach(x => x.onchange = e => { A.roiOn[+e.target.dataset.n] = e.target.checked; atlasRender(); });  // re-renders thumbs + legend
   $('aNotes').onchange = e => { A.notesOn = e.target.checked; atlasCounts(); };
   $('aLeg').onchange = e => { A.legend.on = e.target.checked; $('aLegBox').style.display = A.legend.on ? 'block' : 'none'; legendMsg(); atlasSummary(); };
   $('aLegOnly').onchange = e => { A.legend.onlyDescribed = e.target.checked; };
@@ -198,13 +240,13 @@ function atlasPlan() {
   const scans = atlas.scans.filter(s => s.include);
   const sections = [];
   for (const s of scans) for (const p of APLANES)
-    if (atlas.planeOn[p] && s.planes[p]) sections.push({s, p, idxs: sliceList(p)});
+    if (s.planes[p]) sections.push({s, p, idxs: sliceList(p)});
   return sections;
 }
 function atlasSummary() {
   const el = $('aSummary'); if (!el) return;
   const secs_ = atlasPlan(), pages = secs_.reduce((a, s) => a + s.idxs.length, 0);
-  const mb = pages * 0.22 * Math.pow(atlas.quality / 1600, 2);
+  const mb = pages * 0.14 * Math.pow(atlas.quality / 1600, 1.6);
   el.textContent = `${secs_.length} sections, ${pages} image pages (+ title${atlas.legend.on ? ' + legend' : ''}). Estimated size ≈ ${mb < 1000 ? mb.toFixed(0) + ' MB' : (mb / 1000).toFixed(1) + ' GB'}.`;
 }
 
@@ -243,11 +285,43 @@ function boxEdges(p, v) {          // box edges in native thumbnail coordinates
   const [y0, y1] = t.flip ? [n - (v.k1 + 1), n - v.k0] : [v[t.Y + '0'], v[t.Y + '1'] + 1];
   return {x0, x1, y0, y1};
 }
+// full extent of each selected structure projected onto each view (translucent fill)
+function projections() {
+  const sel = rois.filter(r => atlas.roiOn[r.number] && r.ks.length);
+  const key = sel.map(r => r.number + ':' + r.color).join('|');
+  if (projCache.key === key) return projCache.cv;
+  const n = meta.n, out = {};
+  for (const p of APLANES) {
+    const t = thumbGeom(p), cv = document.createElement('canvas'); cv.width = t.w; cv.height = t.h;
+    const ctx = cv.getContext('2d'), tmp = document.createElement('canvas'); tmp.width = t.w; tmp.height = t.h;
+    const tc = tmp.getContext('2d');
+    for (const r of sel) {
+      tc.clearRect(0, 0, t.w, t.h); tc.fillStyle = `rgb(${r.color})`;
+      for (const k of r.ks) for (const poly of r.slices[k]) {
+        if (p === 'ax') {
+          tc.beginPath(); tc.moveTo(poly[0] + .5, poly[1] + .5);
+          for (let j = 2; j < poly.length; j += 2) tc.lineTo(poly[j] + .5, poly[j + 1] + .5);
+          tc.closePath(); tc.fill();
+        } else {
+          let lo = Infinity, hi = -Infinity, o = p === 'sag' ? 1 : 0;   // sag: rows (y), cor: cols (x)
+          for (let j = o; j < poly.length; j += 2) { lo = Math.min(lo, poly[j]); hi = Math.max(hi, poly[j]); }
+          tc.fillRect(lo, (n - 1) - k, hi - lo + 1, 1);
+        }
+      }
+      ctx.globalAlpha = 0.45; ctx.drawImage(tmp, 0, 0); ctx.globalAlpha = 1;
+    }
+    out[p] = cv;
+  }
+  projCache = {key, cv: out};
+  return out;
+}
 function drawThumbs() {
+  const proj = projections();
   for (const p of APLANES) {
     const cv = $('aTh_' + p); if (!cv || !thumbImgs[p]) continue;
     const t = thumbGeom(p), ctx = cv.getContext('2d'), kx = cv.width / t.w, ky = cv.height / t.h;
     ctx.drawImage(thumbImgs[p], 0, 0, cv.width, cv.height);
+    if (proj[p]) ctx.drawImage(proj[p], 0, 0, cv.width, cv.height);
     const b = boxEdges(p, atlas.voi[atlas.edit]);
     const X0 = b.x0 * kx, X1 = b.x1 * kx, Y0 = b.y0 * ky, Y1 = b.y1 * ky;
     ctx.fillStyle = 'rgba(0,0,0,.55)';
@@ -314,6 +388,8 @@ window.addEventListener('mousemove', e => {
     if (h.t) v[t.Y + top] = clamp(t.Y, t.flip ? Math.max(start.k0 + 4, start.k1 + dY) : Math.min(start[t.Y + '1'] - 4, start[t.Y + '0'] + dY));
     if (h.b) v[t.Y + bot] = clamp(t.Y, t.flip ? Math.min(start.k1 - 4, start.k0 + dY) : Math.max(start[t.Y + '0'] + 4, start[t.Y + '1'] + dY));
   }
+  if (atlas.edit !== 'ax' && t.Y === 'k') fitAspect(atlas.edit, v, h.t ? 't' : h.b ? 'b' : 'keep');
+  else if (atlas.edit !== 'ax') fitAspect(atlas.edit, v, 'keep');
   atlas.voi[atlas.edit] = v;
   atlasCounts();
 });
@@ -420,7 +496,7 @@ async function buildAtlas() {
   const sections = atlasPlan();
   if (!sections.length) { $('aProgTxt').textContent = 'Nothing selected.'; return; }
   const {jsPDF} = window.jspdf;
-  const doc = new jsPDF({unit: 'mm', format: 'a4', orientation: 'portrait', compress: true});
+  const doc = new jsPDF({unit: 'mm', format: 'a4', orientation: 'landscape', compress: true});
   const title = A.title.trim() || 'Contouring atlas';
   const incRois = rois.filter(r => A.roiOn[r.number]);
   const legendRois = incRois.filter(r => !A.legend.onlyDescribed || (A.legend.desc[r.number] || '').trim());
@@ -432,9 +508,9 @@ async function buildAtlas() {
     doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
     let page = [], y = 30;
     for (const r of legendRois) {
-      const lines = doc.splitTextToSize((A.legend.desc[r.number] || '').trim() || '-', 130);
+      const lines = doc.splitTextToSize((A.legend.desc[r.number] || '').trim() || '-', 195);
       const h = Math.max(1, lines.length) * 4.6 + 4;
-      if (y + h > 285) { legendPages.push(page); page = []; y = 30; }
+      if (y + h > 198) { legendPages.push(page); page = []; y = 30; }
       page.push({r, lines, y}); y += h;
     }
     legendPages.push(page);
@@ -468,51 +544,54 @@ async function buildAtlas() {
     return w;
   };
 
-  // ---- title page ----
+  // ---- title page (landscape; contents flow into a second column) ----
   {
-    const W = 210, H = 297; bg(W, H);
+    const W = PG.W, H = PG.H; bg(W, H);
     doc.setTextColor(...FG); doc.setFont('helvetica', 'bold'); doc.setFontSize(26);
-    doc.text(doc.splitTextToSize(title, 170), 20, 40);
+    const tl = doc.splitTextToSize(title, 250);
+    doc.text(tl, 20, 30);
     doc.setFont('helvetica', 'normal'); doc.setFontSize(12); doc.setTextColor(...DIM);
-    let y = 40 + doc.splitTextToSize(title, 170).length * 11 + 4;
-    if (A.creator.trim()) { doc.text('Created by ' + A.creator.trim(), 20, y); y += 7; }
-    doc.text(new Date().toLocaleDateString(undefined, {year: 'numeric', month: 'long', day: 'numeric'}), 20, y); y += 14;
+    let y = 30 + tl.length * 11;
+    const meta_ = [A.creator.trim() ? 'Created by ' + A.creator.trim() : null,
+                   new Date().toLocaleDateString(undefined, {year: 'numeric', month: 'long', day: 'numeric'})].filter(Boolean);
+    doc.text(meta_.join('   |   '), 20, y); y += 12;
     doc.setTextColor(...FG); doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.text('Contents', 20, y); y += 8;
     doc.setFontSize(10.5); doc.setFont('helvetica', 'normal');
+    const top = y, bottom = H - 26, colW = 120, cols = [20, 20 + colW + 15];
+    let col = 0;
+    const need = h => { if (y + h > bottom && col === 0) { col = 1; y = top; } };
     const row = (label, page, indent) => {
-      doc.setTextColor(...FG); doc.text(label, 20 + (indent || 0), y);
-      doc.setTextColor(...ACC); doc.text('p. ' + page, 190, y, {align: 'right'});
-      doc.link(20, y - 4, 170, 5.5, {pageNumber: page}); y += 6.2;
+      need(6.2); const x = cols[col];
+      doc.setTextColor(...FG); doc.text(label, x + (indent || 0), y);
+      doc.setTextColor(...ACC); doc.text('p. ' + page, x + colW, y, {align: 'right'});
+      doc.link(x, y - 4, colW, 5.5, {pageNumber: page}); y += 6.2;
     };
     if (legendFirst) row('Legend', legendFirst);
     let lastScan = null;
     for (const sec of sections) {
       if (sec.s.key !== lastScan) {
-        y += 2; doc.setFont('helvetica', 'bold'); doc.setTextColor(...FG); doc.text(atlasName(sec.s), 20, y); y += 6; doc.setFont('helvetica', 'normal');
+        need(14); y += 2; doc.setFont('helvetica', 'bold'); doc.setTextColor(...FG); doc.text(atlasName(sec.s), cols[col], y); y += 6; doc.setFont('helvetica', 'normal');
         lastScan = sec.s.key;
       }
       row(`${PNAME[sec.p]} (${sec.idxs.length} pages, every ${spacingMm(sec.p).toFixed(1)} mm${noteSlices(sec.p).length ? ' + annotated slices' : ''})`, sec.first, 6);
-      if (y > 250) { y = 250; break; }
     }
-    y = Math.max(y + 8, 255);
     doc.setFontSize(9); doc.setTextColor(...DIM);
     const nNotes = notePages.length;
-    doc.text(`${incRois.length} structures, ${nNotes} annotated slice${nNotes === 1 ? '' : 's'}, ${total} pages`, 20, y); y += 5;
-    doc.text('Navigation: each page links to the same slice on the other scans, to the other planes, to the', 20, y); y += 4.5;
-    doc.text('previous/next slice and, where present, to the previous/next annotated slice.', 20, y);
+    doc.text(`${incRois.length} structures, ${nNotes} annotated slice${nNotes === 1 ? '' : 's'}, ${total} pages.  Navigation: each page links to the same slice on the other scans, the other planes,`, 20, H - 16);
+    doc.text('the previous/next slice and, where present, the previous/next annotated slice.', 20, H - 11.5);
   }
   // ---- legend pages ----
   legendPages.forEach((items, li) => {
-    doc.addPage('a4', 'portrait'); bg(210, 297);
+    doc.addPage('a4', 'landscape'); bg(PG.W, PG.H);
     doc.setTextColor(...FG); doc.setFont('helvetica', 'bold'); doc.setFontSize(16);
     doc.text('Legend' + (legendPages.length > 1 ? ` (${li + 1}/${legendPages.length})` : ''), 20, 20);
-    btn(190, 12, 'Contents', 1, false, true);
+    btn(PG.W - 20, 12, 'Contents', 1, false, true);
     for (const it of items) {
       doc.setFillColor(...it.r.color); doc.rect(20, it.y - 3.2, 4, 4, 'F');
       doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.setTextColor(...FG);
-      doc.text(doc.splitTextToSize(it.r.name, 32), 27, it.y);
+      doc.text(doc.splitTextToSize(it.r.name, 50), 27, it.y);
       doc.setFont('helvetica', 'normal'); doc.setTextColor(200, 200, 200);
-      doc.text(it.lines, 62, it.y);
+      doc.text(it.lines, 82, it.y);
     }
   });
 
@@ -522,14 +601,11 @@ async function buildAtlas() {
   try {
     for (const sec of sections) {
       const {s, p, idxs} = sec, g = geomVoi(p, A.voi[p]);
-      // orientation that gives the biggest image
-      const HEAD = 17, FOOT = 15, M = 5;
-      const fit = (PW, PH) => Math.min((PW - 2 * M) / g.mmW, (PH - HEAD - FOOT) / g.mmH);
-      const land = fit(297, 210) >= fit(210, 297);
-      const PW = land ? 297 : 210, PH = land ? 210 : 297, sc = fit(PW, PH);
+      // A4 landscape throughout
+      const {W: PW, H: PH, M, HEAD, FOOT} = PG, land = true;
+      const sc = Math.min((PW - 2 * M) / g.mmW, (PH - HEAD - FOOT) / g.mmH);
       const iw = g.mmW * sc, ih = g.mmH * sc, ix = (PW - iw) / 2, iy = HEAD + (PH - HEAD - FOOT - ih) / 2;
-      const Wpx = g.mmW >= g.mmH ? A.quality : Math.round(A.quality * g.mmW / g.mmH);
-      const Hpx = g.mmW >= g.mmH ? Math.round(A.quality * g.mmH / g.mmW) : A.quality;
+      const Wpx = A.quality, Hpx = Math.max(1, Math.round(A.quality * g.mmH / g.mmW));
       const others = sections.filter(x => x.p === p && x.s.key !== s.key);
       for (let j = 0; j < idxs.length; j++) {
         const idx = idxs[j], here = pageOf[`${s.key}|${p}|${idx}`];
