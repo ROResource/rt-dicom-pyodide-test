@@ -24,15 +24,31 @@
   input[type=number]{width:60px}
   button{margin-right:4px}
   .bar{margin:6px 0}
+  #atlasDlg{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:50;overflow:auto;display:none}
+  #atlasDlg .panel{background:#181818;border:1px solid #444;border-radius:6px;max-width:1100px;margin:20px auto;padding:14px 18px;font-size:13px}
+  #atlasDlg h4{margin:14px 0 6px;color:#8cf;border-bottom:1px solid #333;padding-bottom:3px}
+  #atlasDlg table{border-collapse:collapse} #atlasDlg td,#atlasDlg th{padding:2px 6px;text-align:left}
+  #atlasDlg input[type=text]{background:#222;color:#ddd;border:1px solid #444}
+  #atlasDlg textarea{background:#222;color:#ddd;border:1px solid #444;width:520px;height:34px;font:12px system-ui}
+  #atlasDlg textarea.empty{border-color:#c90}
+  #atlasDlg .thumbs{display:flex;gap:10px;align-items:flex-start;margin-top:6px}
+  #atlasDlg .thumbs canvas{background:#000;cursor:move;border:1px solid #333}
+  #atlasDlg .thumbs div{text-align:center;font-size:12px}
+  #atlasDlg .sw{display:inline-block;width:10px;height:10px;margin-right:4px}
+  #atlasDlg .roiGrid{columns:3;max-height:220px;overflow:auto}
+  #atlasDlg .roiGrid label{display:block;break-inside:avoid}
+  #atlasDlg .foot{position:sticky;bottom:0;background:#181818;padding:10px 0 2px;border-top:1px solid #333;margin-top:12px}
+  #atlasDlg progress{width:300px;vertical-align:middle}
   .scanName{width:170px;background:#222;color:#ddd;border:1px solid #444}
   #stage{position:relative;line-height:0}
   #notesLayer{position:absolute;left:0;top:0;pointer-events:none;line-height:normal}
   canvas.placing{cursor:copy}
-  .note{position:absolute;pointer-events:auto;background:rgba(10,10,10,.82);border:1.5px solid #ffd400;border-radius:4px;width:190px;font-size:12px}
-  .note .nh{display:flex;justify-content:space-between;background:#ffd400;color:#111;font-size:11px;padding:0 4px;cursor:move;user-select:none}
-  .note .nh .del{cursor:pointer;font-weight:bold;padding:0 2px}
-  .note textarea{width:100%;box-sizing:border-box;background:transparent;color:#fff;border:0;resize:horizontal;font:12px/1.35 system-ui;padding:3px 5px;overflow:hidden;min-height:22px}
-  .note textarea:focus{outline:none}
+  .note{position:absolute;pointer-events:auto;background:rgba(10,10,10,.82);border:1.5px solid #ffd400;border-radius:4px;width:max-content;max-width:260px;cursor:move}
+  .note.editing{cursor:text}
+  .note .txt{padding:3px 6px;font:12px/1.35 system-ui;color:#fff;white-space:pre-wrap;overflow-wrap:break-word;min-width:24px;outline:none;cursor:inherit}
+  .note .txt:empty:before{content:'Type note…';color:#888}
+  .note .del{position:absolute;top:-9px;right:-9px;width:16px;height:16px;border-radius:8px;background:#c33;color:#fff;font:bold 12px/16px system-ui;text-align:center;cursor:pointer;display:none}
+  .note:hover .del{display:block}
   #side{display:flex;flex-direction:column;gap:12px;min-width:320px}
   #notesPanel{font-size:13px}
   #notesPanel .nl{max-height:22vh;overflow:auto;margin-top:4px}
@@ -60,6 +76,7 @@
   <small>(A / S / C)</small>
   &nbsp;|&nbsp; Image: <span id="imgSel"></span> <small>(T cycles, 1–5 select)</small>
   &nbsp;|&nbsp; <label><input type="checkbox" id="xhair" checked> crosshair</label>
+  &nbsp;|&nbsp; <button id="atlasBtn" disabled style="font-weight:bold">Build atlas PDF…</button>
 </div>
 <div class="bar">
   Crop: <button id="cropAuto" disabled>Auto (body)</button>
@@ -88,6 +105,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/pyodide/v0.29.0/full/pyodide.js"></script>
 <script>
 const PY = String.raw`
@@ -232,6 +250,7 @@ def load(rs_path):
             out.append(dict(number=int(num), name=str(names.get(num, f'ROI {num}')), color=color,
                             nContours=sum(len(v) for v in per_slice.values()), nPoints=npts, slices=per_slice))
         P['info']['unmatchedContours'] = unmatched
+    P['info']['A'] = np.round(P['A'], 5).tolist()     # voxel -> patient, for slice positions in the atlas
     return json.dumps(dict(info=P['info'], rois=out))
 
 # ---------------- registration ----------------
@@ -536,7 +555,7 @@ $('go').onclick = async () => {
     notes = []; pruneNoteEls(); noteMode = null; renderNotesPanel();
     initSlots();
     buildRoiPanel();
-    ['cropAuto', 'cropDraw', 'cropReset', 'addSec'].forEach(id => $(id).disabled = false);
+    ['cropAuto', 'cropDraw', 'cropReset', 'addSec', 'atlasBtn'].forEach(id => $(id).disabled = false);
     $('cropRois').disabled = !rois.length;
     cropAuto();                       // CTs come in with a lot of air/couch: crop by default
   } catch (e) { log('ERROR: ' + e); console.error(e); }
@@ -664,7 +683,7 @@ function noteClick(e) {
   if (noteMode === 'box') {
     pending.box = toNativeF(e);
     const n = pending; pending = null; setNoteMode(false); draw(); renderNotesPanel();
-    const el = noteEls.get(n.id); if (el) el.querySelector('textarea').focus();
+    const el = noteEls.get(n.id); if (el) focusEnd(el.querySelector('.txt'));
     return true;
   }
   return false;
@@ -673,20 +692,30 @@ function noteEl(n) {
   let el = noteEls.get(n.id);
   if (el) return el;
   el = document.createElement('div'); el.className = 'note';
-  el.innerHTML = '<div class="nh"><span class="drag" title="Drag to move">⠿ move</span><span class="del" title="Delete note">×</span></div><textarea rows="1" placeholder="Type note…"></textarea>';
-  const ta = el.querySelector('textarea');
-  ta.value = n.text;
-  const fit = () => { const h0 = ta.style.height; ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; if (ta.style.height !== h0) draw(); };
-  ta.oninput = () => { n.text = ta.value; fit(); renderNotesPanel(); };
-  new ResizeObserver(() => { if (!dragNote) draw(); }).observe(ta);
+  el.innerHTML = '<div class="txt" spellcheck="true"></div><span class="del" title="Delete note">×</span>';
+  const tx = el.querySelector('.txt');
+  try { tx.contentEditable = 'plaintext-only'; } catch (_) { tx.contentEditable = 'true'; }
+  if (tx.contentEditable !== 'plaintext-only') tx.contentEditable = 'true';
+  tx.innerText = n.text;
+  tx.addEventListener('input', () => { n.text = tx.innerText.replace(/\n$/, ''); renderNotesPanel(); draw(); });
+  tx.addEventListener('focus', () => el.classList.add('editing'));
+  tx.addEventListener('blur', () => el.classList.remove('editing'));
+  new ResizeObserver(() => { if (!dragNote) draw(); }).observe(el);
+  el.querySelector('.del').addEventListener('mousedown', e => e.stopPropagation());
   el.querySelector('.del').onclick = () => { notes = notes.filter(x => x !== n); if (pending === n) { pending = null; setNoteMode(false); } pruneNoteEls(); draw(); renderNotesPanel(); };
-  el.querySelector('.nh').addEventListener('mousedown', e => {
-    if (e.target.classList.contains('del')) return;
-    e.preventDefault(); dragNote = {n, what: 'box', x: e.clientX, y: e.clientY, bx: n.box.x, by: n.box.y};
+  // drag the box itself to move it; a click without movement starts editing
+  el.addEventListener('mousedown', e => {
+    if (el.classList.contains('editing')) return;          // while editing, allow normal text selection
+    e.preventDefault();
+    dragNote = {n, what: 'box', x: e.clientX, y: e.clientY, bx: n.box.x, by: n.box.y, moved: false, el: tx};
   });
   $('notesLayer').appendChild(el); noteEls.set(n.id, el);
-  requestAnimationFrame(fit);
   return el;
+}
+function focusEnd(tx) {
+  tx.focus();
+  const r = document.createRange(); r.selectNodeContents(tx); r.collapse(false);
+  const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
 }
 function pruneNoteEls() {
   const ids = new Set(notes.map(n => n.id));
@@ -704,6 +733,8 @@ function renderNotes(p, g, which, ctx, cssW, cssH, dpr) {
     el.style.display = '';
     el.style.pointerEvents = n === pending ? 'none' : '';   // let clicks reach the canvas while placing
     el.style.left = ((n.box.x - g.x0) * kx) + 'px'; el.style.top = ((n.box.y - g.y0) * ky) + 'px';
+    // remember the box geometry in image units so the PDF can reproduce it at any zoom
+    n.bw = el.offsetWidth / kx; n.bh = el.offsetHeight / ky; n.fs = 12 / kx; n.padX = 6 / kx; n.padY = 3 / ky;
     // leader line: anchor -> nearest point of the box
     const ax = (n.anchor.x - g.x0) * kx, ay = (n.anchor.y - g.y0) * ky;
     let l = el.offsetLeft, t = el.offsetTop; const w = el.offsetWidth, h = el.offsetHeight;
@@ -729,7 +760,7 @@ function renderNotesPanel() {
   const sorted = [...notes].sort((a, b) => (a.scan + a.plane).localeCompare(b.scan + b.plane) || a.idx - b.idx);
   const nHere = notes.filter(n => n.scan === which && n.plane === p && n.idx === g.idx).length;
   el.innerHTML = `<b>Notes</b> <small>(${notes.length} total, ${nHere} on this slice)</small><br>
-    <button id="addNote">+ Add note</button> <small>Esc cancels. Drag a dot or a box header to move it.</small>
+    <button id="addNote">+ Add note</button> <small>Click a box to edit, drag it (or its dot) to move. Esc finishes.</small>
     <div class="nl">${sorted.map(n => {
       const isHere = n.scan === which && n.plane === p && n.idx === g.idx;
       return `<div class="ni ${isHere ? 'here' : ''}" data-id="${n.id}">${esc(scanName(n.scan))} · ${PLANE_NAME[n.plane]} ${n.idx + 1}: <span style="color:#aaa">${esc((n.text || '(empty)').slice(0, 60))}</span></div>`;
@@ -761,11 +792,21 @@ window.addEventListener('mousemove', e => {
   if (noteMode === 'box' && pending && e.target === $('cv')) { pending.box = toNativeF(e); draw(); return; }
   if (!dragNote || !view2css) return;
   const {kx, ky} = view2css, d = dragNote;
-  if (d.what === 'box') d.n.box = {x: d.bx + (e.clientX - d.x) / kx, y: d.by + (e.clientY - d.y) / ky};
+  if (d.what === 'box') {
+    if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;
+    d.moved = true;
+    d.n.box = {x: d.bx + (e.clientX - d.x) / kx, y: d.by + (e.clientY - d.y) / ky};
+  }
   else d.n.anchor = toNativeF(e);
   draw();
 });
-window.addEventListener('mouseup', () => { if (dragNote) { if (dragNote.what === 'anchor') suppressClick = true; dragNote = null; draw(); } });
+window.addEventListener('mouseup', () => {
+  if (!dragNote) return;
+  const d = dragNote; dragNote = null;
+  if (d.what === 'anchor') suppressClick = true;
+  if (d.what === 'box' && !d.moved) { focusEnd(d.el); return; }
+  draw();
+});
 
 // ---------- structure panel ----------
 function buildRoiPanel() {
@@ -774,7 +815,7 @@ function buildRoiPanel() {
     <button id="allOn">All on</button><button id="allOff">All off</button>
     &nbsp; Line width <input type="range" id="lw" min="0.5" max="5" step="0.5" value="${lineWidth}" style="width:90px"> <span id="lwv">${lineWidth}</span>
     <table>${rois.map((r, i) => `<tr>
-      <td><input type="checkbox" data-i="${i}" class="vis" checked></td>
+      <td><input type="checkbox" data-i="${i}" class="vis" ${r.visible ? 'checked' : ''}></td>
       <td><input type="color" data-i="${i}" class="col" value="${hex(r.color)}"></td>
       <td><input type="text" data-i="${i}" class="nm" value="${esc(r.name)}" title="Original: ${esc(r.origName)}"></td>
       <td><small>${r.nContours} contours</small></td>
@@ -1007,8 +1048,8 @@ $('wl').onchange = () => draw(); $('xhair').onchange = () => draw();
 document.querySelectorAll('input[name=plane]').forEach(r => r.onchange = () => { syncSlider(); draw(); });
 window.addEventListener('resize', () => draw());
 document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'TEXTAREA' && e.key === 'Escape') { e.target.blur(); return; }
-  if (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'number'))) return;
+  if ((e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) && e.key === 'Escape') { e.target.blur(); return; }
+  if (e.target.isContentEditable || e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'number'))) return;
   if (e.key === 'Escape') { cancelNote(); return; }
   if (!meta) return;
   const k = e.key.toLowerCase(), ids = ['pri', ...loadedIds()];
@@ -1023,5 +1064,6 @@ $('cv').addEventListener('wheel', e => {
   syncSlider(); draw();
 }, {passive: false});
 </script>
+<script src="atlas.js"></script>
 </body>
 </html>

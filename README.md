@@ -14,3 +14,6 @@ Crop (applies to every scan and plane): Auto (body, couch excluded; applied on l
 
 ## Scan names + notes
 Every scan has an editable display name (used in the viewer and, later, the PDF). Notes: "+ Add note", click the point, then click where the text box goes, and type. Each note belongs to one scan + plane + slice. Drag the box header or the dot to reposition; positions are stored in image coordinates so they stay put when cropping or resizing. The notes list jumps to any note.
+
+## Atlas PDF (atlas.js)
+"Build atlas PDF…" opens the builder: title/creator; a separate volume-of-interest box per plane (drag/resize on axial, sagittal and coronal thumbnails; defaults to the current crop) with every-Nth-slice spacing; scans to include with names, W/L and planes; extra CT windows (lung/bone/...); structures (default = visible); notes (annotated slices are always included); optional legend page with structure descriptions. Output (jsPDF, in the browser): title page with linked contents, legend, then one slice per page (axial superior->inferior, sagittal R->L, coronal A->P) for each scan. Every page links to the same slice on the other scans, to the other planes, previous/next slice and previous/next annotated slice.
