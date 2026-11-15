@@ -24,7 +24,12 @@
   input[type=number]{width:60px}
   button{margin-right:4px}
   .bar{margin:6px 0}
-  #atlasDlg{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:50;overflow:auto;display:none}
+  #atlasDlg,#patDlg{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:50;overflow:auto;display:none}
+  #patDlg .panel{background:#181818;border:1px solid #444;border-radius:6px;max-width:1150px;margin:20px auto;padding:14px 18px;font-size:13px}
+  #patDlg h4{margin:14px 0 6px;color:#8cf;border-bottom:1px solid #333;padding-bottom:3px}
+  #patDlg table{border-collapse:collapse;width:100%} #patDlg td,#patDlg th{padding:3px 6px;text-align:left;border-bottom:1px solid #262626}
+  #patDlg tr.dim td{color:#777}
+  #patDlg .ok{color:#9c9} #patDlg .bad{color:#f88} #patDlg .mid{color:#c90}
   #atlasDlg .panel{background:#181818;border:1px solid #444;border-radius:6px;max-width:1100px;margin:20px auto;padding:14px 18px;font-size:13px}
   #atlasDlg h4{margin:14px 0 6px;color:#8cf;border-bottom:1px solid #333;padding-bottom:3px}
   #atlasDlg table{border-collapse:collapse} #atlasDlg td,#atlasDlg th{padding:2px 6px;text-align:left}
@@ -49,6 +54,9 @@
   .note .txt:empty:before{content:'Type note…';color:#888}
   .note .del{position:absolute;top:-9px;right:-9px;width:16px;height:16px;border-radius:8px;background:#c33;color:#fff;font:bold 12px/16px system-ui;text-align:center;cursor:pointer;display:none}
   .note:hover .del{display:block}
+  .note .ntools{position:absolute;bottom:100%;left:-1.5px;display:none;gap:6px;align-items:center;background:#ffd400;color:#111;font:11px system-ui;padding:1px 6px;border-radius:4px 4px 0 0;white-space:nowrap;cursor:default}
+  .note .ntools label{margin:0;cursor:pointer} .note .ntools input{margin:0 2px 0 0;vertical-align:-2px}
+  .note:hover .ntools,.note.editing .ntools{display:flex}
   #side{display:flex;flex-direction:column;gap:12px;min-width:320px}
   #notesPanel{font-size:13px}
   #notesPanel .nl{max-height:22vh;overflow:auto;margin-top:4px}
@@ -56,10 +64,16 @@
   #notesPanel .ni:hover{background:#222}
   #notesPanel .ni.here{border-left-color:#ffd400}
   #addNote.on{background:#ffd400;color:#111}
+.njp{color:#7cf;text-decoration:underline;cursor:pointer;margin:0 1px}
 </style>
 </head>
 <body>
 <h3>RT DICOM test (Pyodide + pydicom, files stay on this computer)</h3>
+<div class="bar">
+  <button id="patBtn" disabled style="font-weight:bold">Import patient folder…</button><input type="file" id="patDir" webkitdirectory multiple style="display:none">
+  <label><input type="checkbox" id="anonChk" checked> Anonymise on import</label>
+  <small id="anonInfo" style="color:#999">Removes names, IDs, dates, institution and private tags as files are read, and remaps UIDs consistently. Text burned into images is not removed.</small>
+</div>
 <fieldset><legend>Primary (CT) &nbsp; <label>Display name <input type="text" id="name_pri" class="scanName" value="CT"></label></legend>
   <label>CT folder: <input type="file" id="ctDir" webkitdirectory multiple></label>
   <label>or CT files: <input type="file" id="ctFiles" multiple></label>
@@ -106,11 +120,136 @@
 
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
 <script src="https://cdn.jsdelivr.net/pyodide/v0.29.0/full/pyodide.js"></script>
 <script>
 const PY = String.raw`
-import os, gc, json, numpy as np, pydicom
+import os, gc, json, hashlib, numpy as np, pydicom
 from collections import deque
+
+# ---------------- anonymisation (applied in memory as each file is read) ----------------
+ANON = {'on': False, 'salt': ''}
+def set_anon(on, salt):
+    ANON['on'] = bool(on); ANON['salt'] = str(salt)
+
+# UIDs that identify a DICOM class/syntax rather than an instance: never remapped
+CLASS_UIDS = {'SOPClassUID', 'ReferencedSOPClassUID', 'MediaStorageSOPClassUID', 'TransferSyntaxUID',
+              'ImplementationClassUID', 'RelatedGeneralSOPClassUID', 'OriginalSpecializedSOPClassUID',
+              'CodingSchemeUID', 'ContextGroupExtensionCreatorUID', 'PrivateInformationCreatorUID',
+              'ReferencedSOPClassUIDInFile', 'ReferencedTransferSyntaxUIDInFile', 'SOPClassesInStudy',
+              'ReferencedRelatedGeneralSOPClassUIDInFile', 'InstanceCreatorUID', 'MappingResourceUID',
+              'ContextUID', 'CodingSchemeRegistry'}
+# removed outright (DICOM PS3.15 basic profile, the identifying parts relevant to RT data)
+PHI_REMOVE = ['PatientAddress', 'PatientTelephoneNumbers', 'OtherPatientIDs', 'OtherPatientNames',
+              'OtherPatientIDsSequence', 'PatientBirthName', 'PatientMotherBirthName', 'PatientComments',
+              'MedicalRecordLocator', 'MilitaryRank', 'BranchOfService', 'EthnicGroup', 'Occupation',
+              'AdditionalPatientHistory', 'PatientInsurancePlanCodeSequence', 'IssuerOfPatientID',
+              'InstitutionName', 'InstitutionAddress', 'InstitutionalDepartmentName', 'InstitutionCodeSequence',
+              'StationName', 'DeviceSerialNumber', 'AccessionNumber', 'StudyID', 'AdmissionID',
+              'RequestAttributesSequence', 'ReferencedPatientSequence', 'ReferringPhysicianAddress',
+              'ReferringPhysicianTelephoneNumbers', 'ReferringPhysicianIdentificationSequence',
+              'PhysiciansOfRecordIdentificationSequence', 'PerformingPhysicianIdentificationSequence',
+              'OperatorIdentificationSequence', 'PerformedProcedureStepID', 'ScheduledProcedureStepID',
+              'RequestedProcedureID', 'PatientAge', 'PatientWeight', 'PatientSize', 'PatientBirthTime',
+              'ResponsibleOrganization', 'ResponsiblePerson', 'PatientState', 'CurrentPatientLocation',
+              'PatientReligiousPreference', 'RegionOfResidence', 'CountryOfResidence']
+_uid_map = {}
+def anon_uid(u):
+    u = str(u)
+    if u not in _uid_map:
+        h = hashlib.sha256((ANON['salt'] + '|' + u).encode()).hexdigest()
+        _uid_map[u] = '2.25.' + str(int(h[:30], 16))      # deterministic: same input -> same UID
+    return _uid_map[u]
+
+def anonymise(ds):
+    """De-identify in place: remove identifying tags, blank names/dates, remap instance UIDs consistently
+    (so references between CT, MR, RTSTRUCT and REG still match). Burned-in pixel text is not removed."""
+    if not ANON['on']:
+        return ds
+    pid = str(getattr(ds, 'PatientID', ''))
+    ds.remove_private_tags()
+    for kw in PHI_REMOVE:
+        if kw in ds:
+            delattr(ds, kw)
+    def cb(d, el):
+        if el.value in (None, '') or el.keyword == 'PixelData':
+            return
+        if el.VR == 'UI' and el.keyword not in CLASS_UIDS:
+            el.value = [anon_uid(v) for v in el.value] if el.VM > 1 else anon_uid(el.value)
+        elif el.VR == 'PN':
+            el.value = ''
+        elif el.VR in ('DA', 'DT', 'TM'):
+            el.value = ''
+    ds.walk(cb)
+    if hasattr(ds, 'file_meta') and 'MediaStorageSOPInstanceUID' in ds.file_meta:
+        ds.file_meta.MediaStorageSOPInstanceUID = anon_uid(ds.file_meta.MediaStorageSOPInstanceUID)
+    ds.PatientName = 'ANON'
+    ds.PatientID = 'ANON-' + hashlib.sha256((ANON['salt'] + '|' + pid).encode()).hexdigest()[:8].upper()
+    ds.PatientIdentityRemoved = 'YES'
+    ds.DeidentificationMethod = 'Basic profile; UIDs remapped; dates removed'
+    return ds
+
+def read_dcm(path, **kw):
+    return anonymise(pydicom.dcmread(path, force=True, **kw))
+
+# ---------------- quick header read for sorting a whole patient folder ----------------
+def _plane_of(iop):
+    try:
+        v = np.array(iop, float); n = np.abs(np.cross(v[:3], v[3:]))
+        ax = ['sagittal', 'coronal', 'axial'][int(np.argmax(n))]
+        return ax if n.max() > 0.985 else ax + ' oblique'
+    except Exception:
+        return ''
+
+def header(path, truncated=False):
+    """Summarise one file without pixel data. Returns need_full if the (truncated) read ran out."""
+    try:
+        d = pydicom.dcmread(path, stop_before_pixels=True, force=True)
+        mod = str(getattr(d, 'Modality', ''))
+        if not mod and 'SOPClassUID' not in d:
+            return json.dumps(dict(ok=False))
+        if truncated and mod in ('RTSTRUCT', 'REG'):
+            return json.dumps(dict(ok=False, need_full=True))
+        o = dict(ok=True, mod=mod, series=str(getattr(d, 'SeriesInstanceUID', '')), desc=str(getattr(d, 'SeriesDescription', '')),
+                 FoR=str(getattr(d, 'FrameOfReferenceUID', '')), date=str(getattr(d, 'SeriesDate', '') or getattr(d, 'StudyDate', '')),
+                 time=str(getattr(d, 'SeriesTime', '') or ''), study=str(getattr(d, 'StudyInstanceUID', '')),
+                 pid=str(getattr(d, 'PatientID', '')), sop=str(getattr(d, 'SOPInstanceUID', '')))
+        if mod == 'RTSTRUCT':
+            o['refFoR'] = [str(f.FrameOfReferenceUID) for f in getattr(d, 'ReferencedFrameOfReferenceSequence', [])]
+            refs = []
+            for f in getattr(d, 'ReferencedFrameOfReferenceSequence', []):
+                for st in getattr(f, 'RTReferencedStudySequence', []):
+                    for se in getattr(st, 'RTReferencedSeriesSequence', []):
+                        refs.append(str(se.SeriesInstanceUID))
+            o['refSeries'] = refs
+            o['label'] = str(getattr(d, 'StructureSetLabel', '') or getattr(d, 'StructureSetName', ''))
+            o['nROI'] = len(getattr(d, 'StructureSetROISequence', []))
+            o['date'] = str(getattr(d, 'StructureSetDate', '') or o['date'])
+        elif mod == 'REG':
+            f = [str(getattr(d, 'FrameOfReferenceUID', ''))]
+            for it in getattr(d, 'RegistrationSequence', []):
+                f.append(str(it.FrameOfReferenceUID))
+            for it in getattr(d, 'DeformableRegistrationSequence', []):
+                f.append(str(it.SourceFrameOfReferenceUID))
+            o['fors'] = sorted(set(x for x in f if x))
+            o['deformable'] = 'DeformableRegistrationSequence' in d
+        elif 'ImageOrientationPatient' in d:
+            o['plane'] = _plane_of(d.ImageOrientationPatient)
+            o['rows'] = int(getattr(d, 'Rows', 0)); o['cols'] = int(getattr(d, 'Columns', 0))
+            o['ps'] = float(d.PixelSpacing[0]) if 'PixelSpacing' in d else 0
+            o['thk'] = float(getattr(d, 'SliceThickness', 0) or 0)
+        return json.dumps(o)
+    except Exception as e:
+        return json.dumps(dict(ok=False, need_full=bool(truncated), err=str(e)[:100]))
+    finally:
+        try: os.remove(path)
+        except Exception: pass
+
+def add_reg(key, path):
+    """Register an extra REG file (not tied to a scan slot); re-resolves all secondaries."""
+    REGS[key] = read_dcm(path)
+    os.remove(path)
+    return json.dumps(resolve_all() if P is not None else {})
 
 P = None          # primary series
 SEC = {}          # secondary id -> series (+ T, Ainv, cache, invert)
@@ -139,7 +278,7 @@ def ingest(tag, path):
     mod = str(getattr(d, 'Modality', ''))
     if 'PixelData' not in d or mod in NON_IMAGE:
         if mod in ('REG', 'RTSTRUCT'):
-            OTHER[tag].append(d)
+            OTHER[tag].append(anonymise(d))
         return mod or 'other'
     fc = FACTOR[tag]
     if fc['f'] is None:
@@ -167,6 +306,7 @@ def ingest(tag, path):
     del d.PixelData
     if hasattr(d, '_pixel_array'):
         d._pixel_array = None
+    anonymise(d)
     ING[tag].append((d, arr))
     return mod
 
@@ -219,7 +359,7 @@ def load(rs_path):
     sl, ps, row, col, normal, pos = P['slices'], P['ps'], P['row'], P['col'], P['normal'], P['pos']
     uid_to_idx = {d.SOPInstanceUID: i for i, d in enumerate(sl)}
     out = []
-    rs = pydicom.dcmread(rs_path, force=True) if rs_path else next((d for d in OTHER.get('pri', []) if d.Modality == 'RTSTRUCT'), None)
+    rs = read_dcm(rs_path) if rs_path else next((d for d in OTHER.get('pri', []) if d.Modality == 'RTSTRUCT'), None)
     if rs is not None:
         names = {r.ROINumber: r.ROIName for r in rs.StructureSetROISequence}
         tol = abs(P['gap']) / 2 or 1.0
@@ -341,7 +481,7 @@ def resolve_all():
     return out
 
 def load_secondary(tag, reg_path, invert):
-    reg = pydicom.dcmread(reg_path, force=True) if reg_path else None
+    reg = read_dcm(reg_path) if reg_path else None
     if reg is None:   # fall back to a REG sitting in the secondary folder
         regs = [d for d in OTHER.get(tag, []) if getattr(d, 'Modality', '') == 'REG']
         reg = regs[0] if regs else None
@@ -505,8 +645,8 @@ const secs = {};                         // id -> {shown, loaded, label, ww, wl,
     await py.loadPackage(['numpy', 'micropip']);
     await py.runPythonAsync("import micropip\nawait micropip.install('pydicom')");
     await py.runPythonAsync(PY);
-    log('pydicom ' + py.runPython('pydicom.__version__') + ' ready. Choose CT + RTSTRUCT, then Load primary.');
-    $('go').disabled = false;
+    log('pydicom ' + py.runPython('pydicom.__version__') + ' ready. Import a patient folder, or choose CT + RTSTRUCT and Load primary.');
+    $('go').disabled = false; $('patBtn').disabled = false;
   } catch (e) { log('ERROR: ' + e); }
 })();
 
@@ -537,14 +677,23 @@ const unhex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 
 // ---------- primary ----------
-$('go').onclick = async () => {
+// anonymisation: decided when the primary is loaded and then used for every scan, REG and RTSTRUCT
+function anonSalt() {
+  let s = localStorage.getItem('rtAtlasSalt');
+  if (!s) { s = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''); localStorage.setItem('rtAtlasSalt', s); }
+  return s;
+}
+let anonOn = true;
+async function loadPrimaryFrom(ctFiles, rsFile) {
   try {
-    const ctFiles = [...$('ctDir').files, ...$('ctFiles').files];
-    if (!ctFiles.length) return log('Pick CT files first.');
+    if (!ctFiles.length) { log('Pick CT files first.'); return false; }
+    anonOn = $('anonChk').checked;
+    py.globals.get('set_anon')(anonOn, anonSalt());
+    $('anonInfo').textContent = anonOn ? 'Data in this session is anonymised as it is read (names, IDs, dates removed; UIDs remapped).' : 'Not anonymised.';
     const t = performance.now();
     log(`Reading ${ctFiles.length} primary files…`);
     await ingestFiles(ctFiles, 'pri', false);
-    const rsPath = await writeOne($('rs').files[0], 'rs');
+    const rsPath = await writeOne(rsFile, 'rs');
     const res = JSON.parse(py.globals.get('load')(rsPath));
     meta = res.info;
     rois = res.rois.map(r => ({...r, origName: r.name, visible: true,
@@ -553,13 +702,16 @@ $('go').onclick = async () => {
     pos = {k: Math.floor(meta.n / 2), r: Math.floor(meta.rows / 2), c: Math.floor(meta.cols / 2)};
     crop = null; current = 'pri';
     notes = []; pruneNoteEls(); noteMode = null; renderNotesPanel();
+    if (typeof atlas !== 'undefined') atlas = null;
     initSlots();
     buildRoiPanel();
     ['cropAuto', 'cropDraw', 'cropReset', 'addSec', 'atlasBtn'].forEach(id => $(id).disabled = false);
     $('cropRois').disabled = !rois.length;
     cropAuto();                       // CTs come in with a lot of air/couch: crop by default
-  } catch (e) { log('ERROR: ' + e); console.error(e); }
-};
+    return true;
+  } catch (e) { log('ERROR: ' + e); console.error(e); return false; }
+}
+$('go').onclick = () => loadPrimaryFrom([...$('ctDir').files, ...$('ctFiles').files], $('rs').files[0]);
 
 // ---------- secondary slots ----------
 function initSlots() {
@@ -586,14 +738,17 @@ function showSlot(id) { secs[id].shown = true; $('slot_' + id).style.display = '
 $('addSec').onclick = () => { const id = SLOT_IDS.find(i => !secs[i].shown); if (id) showSlot(id); };
 
 async function loadSecondary(id) {
+  return loadSecondaryFrom(id, [...$('dir_' + id).files, ...$('files_' + id).files], $('reg_' + id).files[0]);
+}
+async function loadSecondaryFrom(id, files, regFile) {
   try {
-    const files = [...$('dir_' + id).files, ...$('files_' + id).files];
-    if (!files.length) return log(`Scan ${id}: pick image files first.`);
+    if (!files.length) { log(`Scan ${id}: pick image files first.`); return false; }
+    showSlot(id);
     secs[id].loaded = false; if (current === id) current = 'pri'; buildImgSel(); draw();
     const t = performance.now();
     log(`Reading ${files.length} files for ${id}…`);
     await ingestFiles(files, id, true);
-    const regPath = await writeOne($('reg_' + id).files[0], 'reg');
+    const regPath = await writeOne(regFile, 'reg');
     const res = JSON.parse(py.globals.get('load_secondary')(id, regPath, $('inv_' + id).checked));
     const info = res.info;
     log(`${id} parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(info));
@@ -602,7 +757,8 @@ async function loadSecondary(id) {
     $('name_' + id).value = secs[id].label; $('nmw_' + id).style.display = '';
     applyResolve(res.all);
     current = id; buildImgSel(); draw();
-  } catch (e) { log('ERROR: ' + e); console.error(e); }
+    return true;
+  } catch (e) { log('ERROR: ' + e); console.error(e); return false; }
 }
 function removeSecondary(id) {
   if (secs[id].loaded) applyResolve(JSON.parse(py.globals.get('remove_secondary')(id)));
@@ -649,12 +805,39 @@ function selectImage(v) { current = v; buildImgSel(); draw(); renderNotesPanel()
 
 $('name_pri').oninput = e => { priName = e.target.value; buildImgSel(); draw(); renderNotesPanel(); };
 
-// ---------- notes (scan + plane + slice specific; positions stored in native plane pixels) ----------
+// ---------- notes ----------
+// A note belongs to one scan. Its dot is a single 3D point in the primary grid, so it can be shown on
+// any plane; the "home" plane is where it was created, and each plane it is shown on keeps its own box.
+// pt.c / pt.r: continuous column/row (pixel-edge based, like the canvas); pt.k: continuous slice index.
 let notes = [], noteSeq = 1, noteMode = null, pending = null, suppressClick = false;
 let view2css = null;                    // {g, kx, ky}: native px -> css px for the current draw
 const noteEls = new Map();              // note id -> DOM element
 const PLANE_NAME = {ax: 'Axial', sag: 'Sagittal', cor: 'Coronal'};
+const PLANE_SHORT = {ax: 'Ax', sag: 'Sag', cor: 'Cor'};
 const curWhich = () => secs[current] && secs[current].loaded ? current : 'pri';
+
+function noteIdx(n, p) { return p === 'ax' ? Math.round(n.pt.k) : p === 'sag' ? Math.floor(n.pt.c) : Math.floor(n.pt.r); }
+function noteAnchor(n, p) {
+  const yk = (meta.n - 1 - n.pt.k) + 0.5;
+  return p === 'ax' ? {x: n.pt.c, y: n.pt.r} : p === 'sag' ? {x: n.pt.r, y: yk} : {x: n.pt.c, y: yk};
+}
+function setNoteAnchor(n, p, a) {      // move the dot within plane p (the third coordinate is kept)
+  const k = (meta.n - 1) - (a.y - 0.5);
+  if (p === 'ax') { n.pt.c = a.x; n.pt.r = a.y; }
+  else if (p === 'sag') { n.pt.r = a.x; n.pt.k = k; }
+  else { n.pt.c = a.x; n.pt.k = k; }
+}
+function noteShown(n, p, idx, which) { return n.scan === which && n.views[p] && n.views[p].on && noteIdx(n, p) === idx; }
+function defaultNoteBox(n, p) {
+  const a = noteAnchor(n, p), g = planeGeom(p);
+  return {x: a.x + g.cw * 0.08, y: a.y - g.ch * 0.08};
+}
+function setNoteView(n, p, on) {
+  if (!on && Object.entries(n.views).filter(([q, v]) => v.on && q !== p).length === 0) return false;   // keep at least one
+  if (!n.views[p]) n.views[p] = {on, box: defaultNoteBox(n, p)};
+  n.views[p].on = on;
+  return true;
+}
 
 function toNativeF(e) {                 // continuous native-plane coords (pixel-edge based)
   const g = planeGeom(radio('plane')), rect = $('cv').getBoundingClientRect();
@@ -672,16 +855,19 @@ function cancelNote() {
 }
 // returns true if the click was consumed by note placement
 function noteClick(e) {
+  const p = radio('plane');
   if (noteMode === 'anchor') {
-    const a = toNativeF(e), p = radio('plane'), g = planeGeom(p);
-    pending = {id: noteSeq++, scan: curWhich(), plane: p, idx: g.idx, anchor: a,
-               box: {x: a.x + g.cw * 0.08, y: a.y - g.ch * 0.08}, text: ''};
-    notes.push(pending); noteMode = 'box';
+    const a = toNativeF(e), g = planeGeom(p);
+    const n = {id: noteSeq++, scan: curWhich(), home: p, pt: {c: 0, r: 0, k: 0}, text: '', views: {}};
+    if (p === 'ax') n.pt.k = g.idx; else if (p === 'sag') n.pt.c = g.idx + 0.5; else n.pt.r = g.idx + 0.5;
+    setNoteAnchor(n, p, a);
+    n.views[p] = {on: true, box: defaultNoteBox(n, p)};
+    pending = n; notes.push(n); noteMode = 'box';
     $('addNote').textContent = 'Now click where the text box goes…';
     draw(); return true;
   }
   if (noteMode === 'box') {
-    pending.box = toNativeF(e);
+    pending.views[p].box = toNativeF(e);
     const n = pending; pending = null; setNoteMode(false); draw(); renderNotesPanel();
     const el = noteEls.get(n.id); if (el) focusEnd(el.querySelector('.txt'));
     return true;
@@ -692,22 +878,31 @@ function noteEl(n) {
   let el = noteEls.get(n.id);
   if (el) return el;
   el = document.createElement('div'); el.className = 'note';
-  el.innerHTML = '<div class="txt" spellcheck="true"></div><span class="del" title="Delete note">×</span>';
+  el.innerHTML = `<div class="ntools">Show on: ${['ax', 'sag', 'cor'].map(p =>
+      `<label><input type="checkbox" data-p="${p}">${PLANE_SHORT[p]}</label>`).join('')}</div>
+    <div class="txt" spellcheck="true"></div><span class="del" title="Delete note">×</span>`;
   const tx = el.querySelector('.txt');
   try { tx.contentEditable = 'plaintext-only'; } catch (_) { tx.contentEditable = 'true'; }
   if (tx.contentEditable !== 'plaintext-only') tx.contentEditable = 'true';
   tx.innerText = n.text;
   tx.addEventListener('input', () => { n.text = tx.innerText.replace(/\n$/, ''); renderNotesPanel(); draw(); });
   tx.addEventListener('focus', () => el.classList.add('editing'));
-  tx.addEventListener('blur', () => el.classList.remove('editing'));
+  tx.addEventListener('blur', () => setTimeout(() => { if (!el.contains(document.activeElement)) el.classList.remove('editing'); }, 0));
   new ResizeObserver(() => { if (!dragNote) draw(); }).observe(el);
+  const tools = el.querySelector('.ntools');
+  tools.addEventListener('mousedown', e => e.stopPropagation());
+  tools.querySelectorAll('input').forEach(cb => cb.onchange = () => {
+    if (!setNoteView(n, cb.dataset.p, cb.checked)) cb.checked = true;
+    renderNotesPanel(); draw();
+  });
   el.querySelector('.del').addEventListener('mousedown', e => e.stopPropagation());
   el.querySelector('.del').onclick = () => { notes = notes.filter(x => x !== n); if (pending === n) { pending = null; setNoteMode(false); } pruneNoteEls(); draw(); renderNotesPanel(); };
   // drag the box itself to move it; a click without movement starts editing
   el.addEventListener('mousedown', e => {
-    if (el.classList.contains('editing')) return;          // while editing, allow normal text selection
+    if (el.classList.contains('editing') && e.target === tx) return;   // while editing, allow text selection
     e.preventDefault();
-    dragNote = {n, what: 'box', x: e.clientX, y: e.clientY, bx: n.box.x, by: n.box.y, moved: false, el: tx};
+    const v = n.views[radio('plane')];
+    dragNote = {n, what: 'box', v, x: e.clientX, y: e.clientY, bx: v.box.x, by: v.box.y, moved: false, el: tx};
   });
   $('notesLayer').appendChild(el); noteEls.set(n.id, el);
   return el;
@@ -726,23 +921,22 @@ function renderNotes(p, g, which, ctx, cssW, cssH, dpr) {
   layer.style.width = cssW + 'px'; layer.style.height = cssH + 'px';
   const kx = cssW / g.cw, ky = cssH / g.ch;
   view2css = {g, kx, ky};
-  const here = notes.filter(n => n.scan === which && n.plane === p && n.idx === g.idx);
+  const here = notes.filter(n => noteShown(n, p, g.idx, which));
   for (const n of notes) { const el = noteEls.get(n.id); if (el && !here.includes(n)) el.style.display = 'none'; }
   for (const n of here) {
-    const el = noteEl(n);
+    const el = noteEl(n), v = n.views[p];
+    el.querySelectorAll('.ntools input').forEach(cb => cb.checked = !!(n.views[cb.dataset.p] && n.views[cb.dataset.p].on));
     el.style.display = '';
     el.style.pointerEvents = n === pending ? 'none' : '';   // let clicks reach the canvas while placing
-    el.style.left = ((n.box.x - g.x0) * kx) + 'px'; el.style.top = ((n.box.y - g.y0) * ky) + 'px';
-    // remember the box geometry in image units so the PDF can reproduce it at any zoom
-    n.bw = el.offsetWidth / kx; n.bh = el.offsetHeight / ky; n.fs = 12 / kx; n.padX = 6 / kx; n.padY = 3 / ky;
-    // leader line: anchor -> nearest point of the box
-    const ax = (n.anchor.x - g.x0) * kx, ay = (n.anchor.y - g.y0) * ky;
+    el.style.left = ((v.box.x - g.x0) * kx) + 'px'; el.style.top = ((v.box.y - g.y0) * ky) + 'px';
+    // remember the box geometry in image units so the PDF/PPT can reproduce it at any zoom
+    v.bw = el.offsetWidth / kx; v.bh = el.offsetHeight / ky; v.fs = 12 / kx; v.padX = 6 / kx; v.padY = 3 / ky;
+    const an = noteAnchor(n, p), ax = (an.x - g.x0) * kx, ay = (an.y - g.y0) * ky;
     let l = el.offsetLeft, t = el.offsetTop; const w = el.offsetWidth, h = el.offsetHeight;
-    // keep the box inside the image
-    const lc = Math.max(0, Math.min(cssW - w, l)), tc = Math.max(0, Math.min(cssH - h, t));
+    const lc = Math.max(0, Math.min(cssW - w, l)), tc = Math.max(0, Math.min(cssH - h, t));   // keep inside the image
     if (lc !== l || tc !== t) {
       l = lc; t = tc; el.style.left = l + 'px'; el.style.top = t + 'px';
-      if (!dragNote || dragNote.n !== n) n.box = {x: g.x0 + l / kx, y: g.y0 + t / ky};
+      if (!dragNote || dragNote.n !== n) v.box = {x: g.x0 + l / kx, y: g.y0 + t / ky};
     }
     const px = Math.max(l, Math.min(l + w, ax)), py = Math.max(t, Math.min(t + h, ay));
     ctx.save();
@@ -757,53 +951,54 @@ function renderNotesPanel() {
   const el = $('notesPanel'); if (!el) return;
   if (!meta) { el.innerHTML = ''; return; }
   const p = radio('plane'), g = planeGeom(p), which = curWhich();
-  const sorted = [...notes].sort((a, b) => (a.scan + a.plane).localeCompare(b.scan + b.plane) || a.idx - b.idx);
-  const nHere = notes.filter(n => n.scan === which && n.plane === p && n.idx === g.idx).length;
+  const sorted = [...notes].sort((a, b) => a.scan.localeCompare(b.scan) || a.home.localeCompare(b.home) || noteIdx(a, a.home) - noteIdx(b, b.home));
+  const nHere = notes.filter(n => noteShown(n, p, g.idx, which)).length;
   el.innerHTML = `<b>Notes</b> <small>(${notes.length} total, ${nHere} on this slice)</small><br>
-    <button id="addNote">+ Add note</button> <small>Click a box to edit, drag it (or its dot) to move. Esc finishes.</small>
+    <button id="addNote">+ Add note</button> <small>Click a box to edit (tick "Show on" planes above it), drag it or its dot to move. Esc finishes.</small>
     <div class="nl">${sorted.map(n => {
-      const isHere = n.scan === which && n.plane === p && n.idx === g.idx;
-      return `<div class="ni ${isHere ? 'here' : ''}" data-id="${n.id}">${esc(scanName(n.scan))} · ${PLANE_NAME[n.plane]} ${n.idx + 1}: <span style="color:#aaa">${esc((n.text || '(empty)').slice(0, 60))}</span></div>`;
+      const planes = ['ax', 'sag', 'cor'].filter(q => n.views[q] && n.views[q].on).map(q => `<a class="njp" data-p="${q}" title="Show on ${PLANE_NAME[q]}">${PLANE_SHORT[q]}</a>`).join(' ');
+      return `<div class="ni ${noteShown(n, p, g.idx, which) ? 'here' : ''}" data-id="${n.id}">${esc(scanName(n.scan))} · ${PLANE_NAME[n.home]} ${noteIdx(n, n.home) + 1} <small>(${planes})</small>: <span style="color:#aaa">${esc((n.text || '(empty)').slice(0, 60))}</span></div>`;
     }).join('')}</div>`;
   $('addNote').onclick = () => { if (noteMode) cancelNote(); else setNoteMode(true); };
   if (noteMode) { $('addNote').classList.add('on'); $('addNote').textContent = noteMode === 'anchor' ? 'Click the point on the image…' : 'Now click where the text box goes…'; }
-  el.querySelectorAll('.ni').forEach(d => d.onclick = () => jumpToNote(notes.find(n => n.id === +d.dataset.id)));
+  el.querySelectorAll('.ni').forEach(d => d.onclick = (e) => { const j = e.target.closest('.njp'); jumpToNote(notes.find(n => n.id === +d.dataset.id), j ? j.dataset.p : undefined); });
 }
-function jumpToNote(n) {
+function jumpToNote(n, plane) {
   if (!n) return;
   if (n.scan !== 'pri' && !(secs[n.scan] && secs[n.scan].loaded)) return;
-  current = n.scan; setRadio('plane', n.plane); setIdx(n.plane, n.idx);
+  const p = plane || n.home, idx = noteIdx(n, p);
+  current = n.scan; setRadio('plane', p); setIdx(p, idx);
   const c = crop || fullCrop();
-  const inside = n.plane === 'ax' ? n.idx >= c.k0 && n.idx <= c.k1 : n.plane === 'sag' ? n.idx >= c.c0 && n.idx <= c.c1 : n.idx >= c.r0 && n.idx <= c.r1;
+  const inside = p === 'ax' ? idx >= c.k0 && idx <= c.k1 : p === 'sag' ? idx >= c.c0 && idx <= c.c1 : idx >= c.r0 && idx <= c.r1;
   if (!inside) setCrop(fullCrop(), 'Full (note was outside crop)');
   buildImgSel(); syncSlider(); draw(); renderNotesPanel();
 }
-// drag a note's box (header) or its anchor dot
+// drag a note's box or its anchor dot
 let dragNote = null;
 $('cv').addEventListener('mousedown', e => {
   if (!meta || cropMode || noteMode || !view2css) return;
   const rect = $('cv').getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
   const {g, kx, ky} = view2css, p = radio('plane'), which = curWhich();
-  const hit = notes.find(n => n.scan === which && n.plane === p && n.idx === g.idx &&
-    Math.hypot((n.anchor.x - g.x0) * kx - mx, (n.anchor.y - g.y0) * ky - my) < 8);
-  if (hit) { e.preventDefault(); dragNote = {n: hit, what: 'anchor'}; }
+  const hit = notes.find(n => { if (!noteShown(n, p, g.idx, which)) return false;
+    const a = noteAnchor(n, p); return Math.hypot((a.x - g.x0) * kx - mx, (a.y - g.y0) * ky - my) < 8; });
+  if (hit) { e.preventDefault(); dragNote = {n: hit, what: 'anchor', p}; }
 });
 window.addEventListener('mousemove', e => {
-  if (noteMode === 'box' && pending && e.target === $('cv')) { pending.box = toNativeF(e); draw(); return; }
+  if (noteMode === 'box' && pending && e.target === $('cv')) { pending.views[radio('plane')].box = toNativeF(e); draw(); return; }
   if (!dragNote || !view2css) return;
   const {kx, ky} = view2css, d = dragNote;
   if (d.what === 'box') {
     if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;
     d.moved = true;
-    d.n.box = {x: d.bx + (e.clientX - d.x) / kx, y: d.by + (e.clientY - d.y) / ky};
+    d.v.box = {x: d.bx + (e.clientX - d.x) / kx, y: d.by + (e.clientY - d.y) / ky};
   }
-  else d.n.anchor = toNativeF(e);
+  else setNoteAnchor(d.n, d.p, toNativeF(e));
   draw();
 });
 window.addEventListener('mouseup', () => {
   if (!dragNote) return;
   const d = dragNote; dragNote = null;
-  if (d.what === 'anchor') suppressClick = true;
+  if (d.what === 'anchor') { suppressClick = true; renderNotesPanel(); }
   if (d.what === 'box' && !d.moved) { focusEnd(d.el); return; }
   draw();
 });
@@ -1065,5 +1260,6 @@ $('cv').addEventListener('wheel', e => {
 }, {passive: false});
 </script>
 <script src="atlas.js"></script>
+<script src="import.js"></script>
 </body>
 </html>

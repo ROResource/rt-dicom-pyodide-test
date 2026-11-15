@@ -85,7 +85,8 @@ function noteSlices(p) {
   if (!atlas.notesOn) return [];
   const v = atlas.voi[p], bases = new Set(atlas.scans.filter(s => s.include && s.planes[p]).map(s => s.base));
   const [lo, hi] = p === 'ax' ? [v.k0, v.k1] : p === 'sag' ? [v.c0, v.c1] : [v.r0, v.r1];
-  return [...new Set(notes.filter(n => n.plane === p && bases.has(n.scan) && (n.text || '').trim() && n.idx >= lo && n.idx <= hi).map(n => n.idx))];
+  return [...new Set(notes.filter(n => n.views[p] && n.views[p].on && bases.has(n.scan) && (n.text || '').trim())
+    .map(n => noteIdx(n, p)).filter(i => i >= lo && i <= hi))];
 }
 function sliceList(p) {
   const v = atlas.voi[p], st = Math.max(1, atlas.step[p] | 0), out = new Set();
@@ -184,7 +185,10 @@ function atlasRender() {
   <small style="color:#999">The CT itself is only ~300–500 px across the crop, so above ~1200 px only contour lines and note text get sharper.</small>
   <div class="foot">
     <span id="aSummary"></span><br>
-    <button id="aBuild" style="font-weight:bold">Build PDF</button> <button id="aClose">Close</button>
+    <button id="aBuild" style="font-weight:bold">Build PDF</button>
+    <button id="aBuildPpt" style="font-weight:bold">Build PowerPoint</button>
+    <select id="aPptLayout" title="PowerPoint slide size"><option value="16x9" ${(A.pptLayout || '16x9') === '16x9' ? 'selected' : ''}>Slides 16:9</option><option value="A4" ${A.pptLayout === 'A4' ? 'selected' : ''}>Slides A4</option></select>
+    <button id="aClose">Close</button>
     <progress id="aProg" value="0" max="1" style="display:none"></progress> <span id="aProgTxt"></span>
   </div></div>`;
 
@@ -220,6 +224,8 @@ function atlasRender() {
   $('aQ').onchange = e => { A.quality = +e.target.value; atlasSummary(); };
   $('aClose').onclick = atlasClose;
   $('aBuild').onclick = buildAtlas;
+  $('aBuildPpt').onclick = buildPptx;
+  $('aPptLayout').onchange = e => A.pptLayout = e.target.value;
   legendMsg(); initThumbs(); refreshThumbImgs(); atlasCounts();
 }
 function legendMsg() {
@@ -247,7 +253,7 @@ function atlasSummary() {
   const el = $('aSummary'); if (!el) return;
   const secs_ = atlasPlan(), pages = secs_.reduce((a, s) => a + s.idxs.length, 0);
   const mb = pages * 0.14 * Math.pow(atlas.quality / 1600, 1.6);
-  el.textContent = `${secs_.length} sections, ${pages} image pages (+ title${atlas.legend.on ? ' + legend' : ''}). Estimated size ≈ ${mb < 1000 ? mb.toFixed(0) + ' MB' : (mb / 1000).toFixed(1) + ' GB'}.`;
+  el.textContent = `${secs_.length} sections, ${pages} image pages (+ title${atlas.legend.on ? ' + legend' : ''}). Estimated size ≈ ${mb < 1000 ? mb.toFixed(0) + ' MB' : (mb / 1000).toFixed(1) + ' GB'} (PDF; PowerPoint similar).`;
 }
 
 // ---------- VOI editor (three thumbnails, box of the plane being edited) ----------
@@ -397,9 +403,11 @@ window.addEventListener('mouseup', () => { if (voiDrag) { voiDrag = null; refres
 
 // ---------- page rendering ----------
 const ROI_DRAWN = new Set();
-function drawNoteOnCanvas(ctx, n, g, sx, sy, W, H) {
-  const fs = (n.fs || g.cw / 60) * sx, k = fs / 12;
-  const padX = (n.padX ? n.padX * sx : 6 * k), padY = (n.padY ? n.padY * sy : 3 * k), lh = fs * 1.35;
+// layout of a note box in output pixels (shared by the PDF raster and the PowerPoint shapes)
+function noteLayout(ctx, n, p, g, sx, sy, W, H) {
+  const v = n.views[p], ref = v.fs ? v : (Object.values(n.views).find(x => x.fs) || {});
+  const fs = (ref.fs || g.cw / 60) * sx, k = fs / 12;
+  const padX = 6 * k, padY = 3 * k, lh = fs * 1.35;
   ctx.font = `${fs}px system-ui, sans-serif`;
   const maxText = 248 * k;
   const lines = [];
@@ -414,10 +422,15 @@ function drawNoteOnCanvas(ctx, n, g, sx, sy, W, H) {
   }
   const tw = Math.max(24 * k, ...lines.map(l => ctx.measureText(l).width));
   const bw = tw + 2 * padX, bh = lines.length * lh + 2 * padY;
-  let bx = (n.box.x - g.x0) * sx, by = (n.box.y - g.y0) * sy;
+  let bx = (v.box.x - g.x0) * sx, by = (v.box.y - g.y0) * sy;
   bx = Math.max(0, Math.min(W - bw, bx)); by = Math.max(0, Math.min(H - bh, by));
-  const ax = (n.anchor.x - g.x0) * sx, ay = (n.anchor.y - g.y0) * sy;
+  const an = noteAnchor(n, p), ax = (an.x - g.x0) * sx, ay = (an.y - g.y0) * sy;
   const px = Math.max(bx, Math.min(bx + bw, ax)), py_ = Math.max(by, Math.min(by + bh, ay));
+  return {fs, k, padX, padY, lh, lines, bx, by, bw, bh, ax, ay, px, py: py_};
+}
+function drawNoteOnCanvas(ctx, n, p, g, sx, sy, W, H) {
+  const {fs, k, padX, padY, lh, lines, bx, by, bw, bh, ax, ay, px, py: py_} = noteLayout(ctx, n, p, g, sx, sy, W, H);
+  ctx.font = `${fs}px system-ui, sans-serif`;
   ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 1.5 * k;
   ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(px, py_); ctx.stroke();
   ctx.fillStyle = 'rgba(10,10,10,.82)'; ctx.fillRect(bx, by, bw, bh);
@@ -429,10 +442,10 @@ function drawNoteOnCanvas(ctx, n, g, sx, sy, W, H) {
 }
 function notesOn(s, p, idx) {
   if (!atlas.notesOn) return [];
-  return notes.filter(n => n.scan === s.base && n.plane === p && n.idx === idx && (n.text || '').trim());
+  return notes.filter(n => noteShown(n, p, idx, s.base) && (n.text || '').trim());
 }
 // returns {canvas, present: [rois on this slice]}
-function renderAtlasImage(s, p, idx, W, H) {
+function renderAtlasImage(s, p, idx, W, H, opts) {
   const v = atlas.voi[p], g = geomVoi(p, v);
   const which = s.kind === 'sec' ? s.key : 'pri';
   const proxy = py.globals.get('plane_rgba')(p, idx, s.ww, s.wl, which); const buf = proxy.toJs(); proxy.destroy();
@@ -470,7 +483,8 @@ function renderAtlasImage(s, p, idx, W, H) {
       ctx.stroke();
     }
   }
-  for (const n of notesOn(s, p, idx)) drawNoteOnCanvas(ctx, n, g, sx, sy, W, H);
+  if (!opts || !opts.vectorNotes) for (const n of notesOn(s, p, idx)) drawNoteOnCanvas(ctx, n, p, g, sx, sy, W, H);
+  if (opts && opts.noLabels) return {cv, present, g, sx, sy};
   // orientation labels
   const fs = Math.round(W / 70);
   ctx.font = `${fs}px system-ui, sans-serif`; ctx.fillStyle = '#ff0'; ctx.textBaseline = 'middle';
@@ -479,7 +493,7 @@ function renderAtlasImage(s, p, idx, W, H) {
   ctx.textAlign = 'right'; ctx.fillText(lab[1], W - fs * .5, H / 2);
   ctx.textAlign = 'center'; ctx.fillText(lab[2], W / 2, fs); ctx.fillText(lab[3], W / 2, H - fs);
   ctx.textAlign = 'left';
-  return {cv, present};
+  return {cv, present, g, sx, sy};
 }
 const canvasJpeg = cv => new Promise(res => cv.toBlob(b => b.arrayBuffer().then(a => res(new Uint8Array(a))), 'image/jpeg', 0.9));
 function slicePosLabel(p, idx) {
@@ -488,6 +502,34 @@ function slicePosLabel(p, idx) {
   if (p === 'ax') return `z ${(A[2][3] + idx * A[2][2]).toFixed(1)} mm`;
   if (p === 'sag') return `x ${(A[0][3] + idx * A[0][0]).toFixed(1)} mm`;
   return `y ${(A[1][3] + idx * A[1][1]).toFixed(1)} mm`;
+}
+
+// ---------- title page backdrop: representative axial slice, blurred and faded into the background ----------
+function titleBackdrop(pxW, pxH) {
+  const pri = atlas.scans.find(s => s.key === 'pri');
+  const v = atlas.voi.ax, g = geomVoi('ax', v);
+  let lo = Infinity, hi = -Infinity;
+  for (const r of rois) if (atlas.roiOn[r.number] && r.ks.length) { lo = Math.min(lo, r.ks[0]); hi = Math.max(hi, r.ks[r.ks.length - 1]); }
+  let k = isFinite(lo) ? Math.round((lo + hi) / 2) : Math.round((v.k0 + v.k1) / 2);
+  k = Math.max(v.k0, Math.min(v.k1, k));
+  const ih = Math.round(pxH * 1.05), iw = Math.round(ih * g.mmW / g.mmH);
+  const {cv} = renderAtlasImage(pri, 'ax', k, iw, ih, {vectorNotes: true, noLabels: true});
+  const out = document.createElement('canvas'); out.width = pxW; out.height = pxH;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#111'; ctx.fillRect(0, 0, pxW, pxH);
+  ctx.filter = `blur(${Math.round(pxW / 500)}px) brightness(0.7)`;
+  ctx.drawImage(cv, pxW - iw * 0.92, (pxH - ih) / 2, iw, ih);
+  ctx.filter = 'none';
+  let gr = ctx.createLinearGradient(0, 0, pxW, 0);
+  gr.addColorStop(0, 'rgba(17,17,17,1)'); gr.addColorStop(0.33, 'rgba(17,17,17,0.97)');
+  gr.addColorStop(0.6, 'rgba(17,17,17,0.45)'); gr.addColorStop(1, 'rgba(17,17,17,0.2)');
+  ctx.fillStyle = gr; ctx.fillRect(0, 0, pxW, pxH);
+  for (const [y0, y1] of [[0, pxH * 0.18], [pxH, pxH * 0.82]]) {
+    gr = ctx.createLinearGradient(0, y0, 0, y1);
+    gr.addColorStop(0, 'rgba(17,17,17,1)'); gr.addColorStop(1, 'rgba(17,17,17,0)');
+    ctx.fillStyle = gr; ctx.fillRect(0, Math.min(y0, y1), pxW, Math.abs(y1 - y0));
+  }
+  return out;
 }
 
 // ---------- PDF ----------
@@ -545,8 +587,10 @@ async function buildAtlas() {
   };
 
   // ---- title page (landscape; contents flow into a second column) ----
+  const backdrop = await canvasJpeg(titleBackdrop(1600, Math.round(1600 * PG.H / PG.W)));
   {
     const W = PG.W, H = PG.H; bg(W, H);
+    doc.addImage(backdrop, 'JPEG', 0, 0, W, H, 'title_bg', 'NONE');
     doc.setTextColor(...FG); doc.setFont('helvetica', 'bold'); doc.setFontSize(26);
     const tl = doc.splitTextToSize(title, 250);
     doc.text(tl, 20, 30);
@@ -596,7 +640,7 @@ async function buildAtlas() {
   });
 
   // ---- image pages ----
-  $('aProg').style.display = ''; $('aProg').max = total; $('aBuild').disabled = true;
+  $('aProg').style.display = ''; $('aProg').max = total; $('aBuild').disabled = $('aBuildPpt').disabled = true;
   const t0 = performance.now();
   try {
     for (const sec of sections) {
@@ -667,5 +711,173 @@ async function buildAtlas() {
     log(`Atlas built: ${total} pages, ${notePages.length} annotated, ${fname}`);
   } catch (e) {
     $('aProgTxt').textContent = 'ERROR: ' + e; log('ERROR building atlas: ' + e); console.error(e);
-  } finally { $('aBuild').disabled = false; }
+  } finally { $('aBuild').disabled = $('aBuildPpt').disabled = false; }
+}
+
+// ---------- PowerPoint ----------
+// Same structure as the PDF. Images carry the scan + contours; notes are native PowerPoint shapes
+// (dot, leader line, text box) so they stay editable, and their text is also put in the speaker notes.
+const PPT_LAYOUTS = {'16x9': {W: 13.333, H: 7.5}, 'A4': {W: 11.69, H: 8.27}};
+async function buildPptx() {
+  const A = atlas;
+  const sections = atlasPlan();
+  if (!sections.length) { $('aProgTxt').textContent = 'Nothing selected.'; return; }
+  const L = PPT_LAYOUTS[A.pptLayout || '16x9'];
+  const pptx = new PptxGenJS();
+  pptx.defineLayout({name: 'ATLAS', width: L.W, height: L.H}); pptx.layout = 'ATLAS';
+  const title = A.title.trim() || 'Contouring atlas';
+  pptx.title = title; if (A.creator.trim()) pptx.author = A.creator.trim();
+  const incRois = rois.filter(r => A.roiOn[r.number]);
+  const legendRois = incRois.filter(r => !A.legend.onlyDescribed || (A.legend.desc[r.number] || '').trim());
+  const hexc = c => c.map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+  const BG = '111111', FG = 'E6E6E6', DIM = '969696', ACC = 'FFD400', FONT = 'Arial';
+  const M = 0.15, HEAD = 0.62, FOOT = 0.55;
+
+  // page numbering (legend: up to 10 structures per slide)
+  const PER_LEG = 10, legendSlides = [];
+  if (A.legend.on) for (let i = 0; i < legendRois.length; i += PER_LEG) legendSlides.push(legendRois.slice(i, i + PER_LEG));
+  let pg = 2;
+  const legendFirst = legendSlides.length ? pg : null; pg += legendSlides.length;
+  const pageOf = {};
+  for (const sec of sections) { sec.first = pg; for (const i of sec.idxs) pageOf[`${sec.s.key}|${sec.p}|${i}`] = pg++; sec.last = pg - 1; }
+  const total = pg - 1;
+  const notePages = [];
+  for (const sec of sections) for (const i of sec.idxs) if (notesOn(sec.s, sec.p, i).length) notePages.push(pageOf[`${sec.s.key}|${sec.p}|${i}`]);
+  notePages.sort((a, b) => a - b);
+  const secOf = (key, p) => sections.find(x => x.s.key === key && x.p === p);
+  const tw = (s, pt) => s.length * pt * 0.0078 + 0.22;      // rough Arial width (in) for button sizing
+  const btn = (slide, x, y, label, target, active, alignRight) => {
+    const w = tw(label, 9), bx = alignRight ? x - w : x, enabled = target != null;
+    const o = {x: bx, y, w, h: 0.26, fontFace: FONT, fontSize: 9, bold: !!active, align: 'center', valign: 'middle', margin: 0,
+               shape: pptx.ShapeType.roundRect, rectRadius: 0.05,
+               fill: {color: active ? ACC : enabled ? '373737' : '202020'}, color: active ? '000000' : enabled ? FG : '5A5A5A'};
+    if (enabled && !active) o.hyperlink = {slide: target, tooltip: label};
+    slide.addText(label, o);
+    return w;
+  };
+  const dataUrl = cv => cv.toDataURL('image/jpeg', 0.9).replace(/^data:/, '');
+
+  $('aProg').style.display = ''; $('aProg').max = total; $('aBuild').disabled = $('aBuildPpt').disabled = true;
+  const t0 = performance.now();
+  try {
+    // ---- title slide ----
+    {
+      const s = pptx.addSlide(); s.background = {color: BG};
+      s.addImage({data: dataUrl(titleBackdrop(1600, Math.round(1600 * L.H / L.W))), x: 0, y: 0, w: L.W, h: L.H});
+      s.addText(title, {x: 0.6, y: 0.5, w: L.W * 0.62, h: 1.1, fontFace: FONT, fontSize: 32, bold: true, color: FG, valign: 'top', margin: 0, fit: 'shrink'});
+      const sub = [A.creator.trim() ? 'Created by ' + A.creator.trim() : null,
+                   new Date().toLocaleDateString(undefined, {year: 'numeric', month: 'long', day: 'numeric'})].filter(Boolean).join('   |   ');
+      s.addText(sub, {x: 0.6, y: 1.6, w: L.W * 0.6, h: 0.35, fontFace: FONT, fontSize: 13, color: DIM, margin: 0});
+      s.addText('Contents', {x: 0.6, y: 2.15, w: 4, h: 0.35, fontFace: FONT, fontSize: 16, bold: true, color: FG, margin: 0});
+      const rows = [];
+      const link = (label, page, indent, bold) => rows.push({text: label, page, indent, bold});
+      if (legendFirst) link('Legend', legendFirst, 0);
+      let last = null;
+      for (const sec of sections) {
+        if (sec.s.key !== last) { rows.push({text: atlasName(sec.s), head: true}); last = sec.s.key; }
+        link(`${PNAME[sec.p]} (${sec.idxs.length} slides)`, sec.first, 0.25);
+      }
+      let y = 2.6; const lh = 0.27, colW = 4.4; let x = 0.6;
+      for (const r of rows) {
+        if (y > L.H - 0.9) { y = 2.6; x += colW + 0.4; }
+        if (r.head) { s.addText(r.text, {x, y, w: colW, h: lh, fontFace: FONT, fontSize: 11, bold: true, color: FG, margin: 0}); }
+        else {
+          s.addText(r.text, {x: x + r.indent, y, w: colW - r.indent - 0.7, h: lh, fontFace: FONT, fontSize: 11, color: FG, margin: 0, hyperlink: {slide: r.page}});
+          s.addText('p. ' + r.page, {x: x + colW - 0.7, y, w: 0.7, h: lh, fontFace: FONT, fontSize: 11, color: ACC, align: 'right', margin: 0, hyperlink: {slide: r.page}});
+        }
+        y += lh;
+      }
+      s.addText(`${incRois.length} structures, ${notePages.length} annotated slides, ${total} slides. Buttons work in slide-show mode.`,
+        {x: 0.6, y: L.H - 0.55, w: L.W - 1.2, h: 0.3, fontFace: FONT, fontSize: 9, color: DIM, margin: 0});
+    }
+    // ---- legend slides ----
+    legendSlides.forEach((items, li) => {
+      const s = pptx.addSlide(); s.background = {color: BG};
+      s.addText('Legend' + (legendSlides.length > 1 ? ` (${li + 1}/${legendSlides.length})` : ''), {x: 0.6, y: 0.35, w: 6, h: 0.5, fontFace: FONT, fontSize: 22, bold: true, color: FG, margin: 0});
+      btn(s, L.W - 0.6, 0.45, 'Contents', 1, false, true);
+      const rowH = (L.H - 1.4) / PER_LEG;
+      items.forEach((r, i) => {
+        const y = 1.1 + i * rowH;
+        s.addShape(pptx.ShapeType.rect, {x: 0.6, y: y + 0.06, w: 0.18, h: 0.18, fill: {color: hexc(r.color)}, line: {color: hexc(r.color)}});
+        s.addText(r.name, {x: 0.9, y, w: 2.4, h: rowH, fontFace: FONT, fontSize: 12, bold: true, color: FG, valign: 'top', margin: 0});
+        s.addText((A.legend.desc[r.number] || '').trim() || '-', {x: 3.4, y, w: L.W - 4.0, h: rowH, fontFace: FONT, fontSize: 11, color: 'C8C8C8', valign: 'top', margin: 0, fit: 'shrink'});
+      });
+    });
+    // ---- image slides ----
+    const mctx = document.createElement('canvas').getContext('2d');
+    for (const sec of sections) {
+      const {s: scan, p, idxs} = sec, g = geomVoi(p, A.voi[p]);
+      const sc = Math.min((L.W - 2 * M) / g.mmW, (L.H - HEAD - FOOT) / g.mmH);
+      const iw = g.mmW * sc, ih = g.mmH * sc, ix = (L.W - iw) / 2, iy = HEAD + (L.H - HEAD - FOOT - ih) / 2;
+      const Wpx = A.quality, Hpx = Math.max(1, Math.round(A.quality * g.mmH / g.mmW)), in_px = iw / Wpx;
+      const others = sections.filter(x => x.p === p && x.s.key !== scan.key);
+      for (let j = 0; j < idxs.length; j++) {
+        const idx = idxs[j], here = pageOf[`${scan.key}|${p}|${idx}`];
+        const s = pptx.addSlide(); s.background = {color: BG};
+        const r = renderAtlasImage(scan, p, idx, Wpx, Hpx, {vectorNotes: true});
+        s.addImage({data: dataUrl(r.cv), x: ix, y: iy, w: iw, h: ih});
+        // notes as editable shapes
+        const ns = notesOn(scan, p, idx);
+        for (const n of ns) {
+          const o = noteLayout(mctx, n, p, r.g, r.sx, r.sy, Wpx, Hpx);
+          const X = v => ix + v * in_px, Y = v => iy + v * in_px;
+          const dx = o.px - o.ax, dy = o.py - o.ay;
+          if (Math.hypot(dx, dy) > 1)
+            s.addShape(pptx.ShapeType.line, {x: X(Math.min(o.ax, o.px)), y: Y(Math.min(o.ay, o.py)), w: Math.abs(dx) * in_px, h: Math.abs(dy) * in_px,
+                       flipV: (dx >= 0) !== (dy >= 0), line: {color: ACC, width: 1.25}});
+          const rr = 4 * o.k * in_px;
+          s.addShape(pptx.ShapeType.ellipse, {x: X(o.ax) - rr, y: Y(o.ay) - rr, w: 2 * rr, h: 2 * rr, fill: {color: ACC}, line: {color: '000000', width: 0.75}});
+          const pt = o.fs * in_px * 72;
+          s.addText(n.text, {x: X(o.bx), y: Y(o.by), w: o.bw * in_px * 1.15, h: o.bh * in_px, fontFace: FONT, fontSize: Math.max(6, Math.round(pt * 10) / 10),
+            color: 'FFFFFF', fill: {color: '0A0A0A', transparency: 18}, line: {color: ACC, width: 1}, valign: 'top',
+            margin: Math.max(1, o.padX * in_px * 72 * 0.8), lineSpacingMultiple: 1.15});
+        }
+        if (ns.length) s.addNotes(ns.map(n => n.text).join('\n\n'));
+        // header
+        s.addText(title, {x: M, y: 0.06, w: L.W * 0.45, h: 0.24, fontFace: FONT, fontSize: 11, bold: true, color: FG, margin: 0});
+        s.addText(`${atlasName(scan)}  |  ${PNAME[p]} ${j + 1}/${idxs.length}  |  ${slicePosLabel(p, idx)}`,
+          {x: L.W * 0.45, y: 0.06, w: L.W * 0.55 - M, h: 0.24, fontFace: FONT, fontSize: 11, color: ACC, align: 'right', margin: 0});
+        let x = M;
+        for (const t of [sec, ...others].sort((a, b) => A.scans.indexOf(a.s) - A.scans.indexOf(b.s)))
+          x += btn(s, x, 0.33, atlasName(t.s), pageOf[`${t.s.key}|${p}|${idx}`], t.s.key === scan.key) + 0.06;
+        let xr = L.W - M;
+        for (const q of [...APLANES].reverse()) {
+          const os = secOf(scan.key, q); if (!os) continue;
+          xr -= btn(s, xr, 0.33, PNAME[q], q === p ? here : os.first + Math.floor((os.last - os.first) / 2), q === p, true) + 0.06;
+        }
+        // footer: structure key + navigation
+        if (r.present.length)
+          s.addText(r.present.flatMap(ro => [{text: '\u25A0 ', options: {color: hexc(ro.color)}}, {text: ro.name + '    ', options: {color: FG}}]),
+            {x: M, y: L.H - FOOT + 0.02, w: L.W - 2 * M, h: 0.2, fontFace: FONT, fontSize: 8, margin: 0});
+        const ny = L.H - 0.3;
+        let bx = M;
+        bx += btn(s, bx, ny, 'Contents', 1, false) + 0.06;
+        if (legendFirst) bx += btn(s, bx, ny, 'Legend', legendFirst, false) + 0.06;
+        bx += 0.12;
+        bx += btn(s, bx, ny, '< Prev slice', j > 0 ? here - 1 : null, false) + 0.06;
+        bx += btn(s, bx, ny, 'Next slice >', j < idxs.length - 1 ? here + 1 : null, false) + 0.06;
+        if (notePages.length) {
+          bx += 0.12;
+          const prev = [...notePages].reverse().find(q => q < here), next = notePages.find(q => q > here);
+          bx += btn(s, bx, ny, '< Prev note', prev ?? null, false) + 0.06;
+          bx += btn(s, bx, ny, 'Next note >', next ?? null, false) + 0.06;
+        }
+        s.addText(`${here} / ${total}`, {x: L.W - M - 1.2, y: ny, w: 1.2, h: 0.26, fontFace: FONT, fontSize: 9, color: DIM, align: 'right', valign: 'middle', margin: 0});
+        $('aProg').value = here;
+        if (here % 5 === 0) {
+          const el = (performance.now() - t0) / 1000, rate = (here - 1) / el;
+          $('aProgTxt').textContent = `slide ${here} / ${total}, ~${Math.max(0, Math.round((total - here) / rate))} s left`;
+          await new Promise(r => setTimeout(r));
+        }
+      }
+    }
+    $('aProgTxt').textContent = 'Writing PowerPoint…';
+    await new Promise(r => setTimeout(r));
+    const fname = (title.replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '_') || 'atlas') + '.pptx';
+    await pptx.writeFile({fileName: fname, compression: true});
+    $('aProgTxt').textContent = `Done: ${total} slides in ${((performance.now() - t0) / 1000).toFixed(0)} s, saved as ${fname}`;
+    log(`Atlas PowerPoint built: ${total} slides, ${fname}`);
+  } catch (e) {
+    $('aProgTxt').textContent = 'ERROR: ' + e; log('ERROR building PowerPoint: ' + e); console.error(e);
+  } finally { $('aBuild').disabled = $('aBuildPpt').disabled = false; }
 }
