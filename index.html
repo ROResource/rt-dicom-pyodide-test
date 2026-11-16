@@ -189,8 +189,29 @@ def anonymise(ds):
     ds.DeidentificationMethod = 'Basic profile; UIDs remapped; dates removed'
     return ds
 
+def fix_meta(d):
+    """Files without a proper DICOM header (e.g. some Monaco/TPS exports) lack the Transfer Syntax UID.
+    Infer it from how the file was actually parsed so pixel data can be decoded."""
+    try:
+        fm = getattr(d, 'file_meta', None)
+        if fm is None:
+            d.file_meta = fm = pydicom.dataset.FileMetaDataset()
+        if 'TransferSyntaxUID' not in fm:
+            enc = getattr(d, 'original_encoding', None)
+            imp, little = (enc if enc and enc[0] is not None else (getattr(d, 'is_implicit_VR', True), getattr(d, 'is_little_endian', True)))
+            if imp is None: imp = True
+            if little is None: little = True
+            fm.TransferSyntaxUID = (pydicom.uid.ImplicitVRLittleEndian if imp else
+                                    pydicom.uid.ExplicitVRLittleEndian if little else pydicom.uid.ExplicitVRBigEndian)
+    except Exception:
+        pass
+    return d
+
+def dcmread_any(path, **kw):
+    return fix_meta(pydicom.dcmread(path, force=True, **kw))
+
 def read_dcm(path, **kw):
-    return anonymise(pydicom.dcmread(path, force=True, **kw))
+    return anonymise(dcmread_any(path, **kw))
 
 # ---------------- quick header read for sorting a whole patient folder ----------------
 def _plane_of(iop):
@@ -204,7 +225,7 @@ def _plane_of(iop):
 def header(path, truncated=False):
     """Summarise one file without pixel data. Returns need_full if the (truncated) read ran out."""
     try:
-        d = pydicom.dcmread(path, stop_before_pixels=True, force=True)
+        d = dcmread_any(path, stop_before_pixels=True)
         mod = str(getattr(d, 'Modality', ''))
         if not mod and 'SOPClassUID' not in d:
             return json.dumps(dict(ok=False))
@@ -271,7 +292,7 @@ def ingest_begin(tag, nfiles, downsample):
 
 def ingest(tag, path):
     try:
-        d = pydicom.dcmread(path, force=True)
+        d = dcmread_any(path)
     except Exception:
         os.remove(path); return 'unreadable'
     os.remove(path)
