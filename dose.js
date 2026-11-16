@@ -32,7 +32,7 @@ async function loadDoseFrom(files) {
     for (const f of files) paths.push(await writeOne(f, 'dose'));
     const info = JSON.parse(py.globals.get('load_dose')(JSON.stringify(paths)));
     log('Dose loaded: ' + JSON.stringify(info));
-    dose = {info, ref: info.max, units: 'abs', mode: dose ? dose.mode : 'wash', alpha: 0.45,
+    dose = {info, ref: (info.rx && info.rx.dose) || info.max, units: 'abs', mode: dose ? dose.mode : 'wash', alpha: 0.45,
             wash: {lo: 30, hi: 100}, iso: ISO_DEFAULT.map(([pct, color]) => ({on: true, pct, color, w: 2})),
             planes: new Map(), isoCache: new Map()};
     if (dose.mode === 'off') dose.mode = 'wash';

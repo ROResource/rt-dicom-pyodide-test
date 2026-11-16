@@ -74,6 +74,28 @@ function fitAspect(p, v, mode) {
   }
   return v;
 }
+// box around one structure (+ margin in mm); sagittal/coronal widened so its whole height fits the page
+function voiForRoi(p, r, mm) {
+  let c0 = Infinity, c1 = -Infinity, r0 = Infinity, r1 = -Infinity;
+  for (const k of r.ks) for (const poly of r.slices[k]) for (let j = 0; j < poly.length; j += 2) {
+    c0 = Math.min(c0, poly[j]); c1 = Math.max(c1, poly[j]); r0 = Math.min(r0, poly[j + 1]); r1 = Math.max(r1, poly[j + 1]);
+  }
+  const gap = Math.abs(meta.sliceGap) || 1, mc = mm / meta.ps[1], mr = mm / meta.ps[0], mk = mm / gap;
+  const cl = (v, hi) => Math.max(0, Math.min(hi, v));
+  const v = {c0: cl(Math.floor(c0 - mc), meta.cols - 1), c1: cl(Math.ceil(c1 + mc), meta.cols - 1),
+             r0: cl(Math.floor(r0 - mr), meta.rows - 1), r1: cl(Math.ceil(r1 + mr), meta.rows - 1),
+             k0: cl(Math.floor(r.ks[0] - mk), meta.n - 1), k1: cl(Math.ceil(r.ks[r.ks.length - 1] + mk), meta.n - 1)};
+  if (p !== 'ax') {
+    const W = p === 'sag' ? 'r' : 'c', psW = p === 'sag' ? meta.ps[0] : meta.ps[1], full = p === 'sag' ? meta.rows : meta.cols;
+    const needW = Math.min(full, Math.ceil((v.k1 - v.k0 + 1) * gap / IMG_ASPECT / psW)), haveW = v[W + '1'] - v[W + '0'] + 1;
+    if (needW > haveW) {
+      const mid = (v[W + '0'] + v[W + '1']) / 2;
+      v[W + '0'] = Math.max(0, Math.min(full - needW, Math.round(mid - needW / 2))); v[W + '1'] = v[W + '0'] + needW - 1;
+    }
+    fitAspect(p, v, 'keep');
+  }
+  return v;
+}
 const atlasName = s => s.kind === 'win' ? s.name : scanName(s.key);
 const atlasDoseMode = () => !doseReady() ? 'off' : dose.mode === 'off' ? 'iso' : dose.mode;
 const pageHasDose = s => !!(s.dose && doseReady());
@@ -150,6 +172,10 @@ function atlasRender() {
     <td id="aSp_${p}">${spacingMm(p).toFixed(1)} mm</td><td id="aPg_${p}">${sliceList(p).length}</td><td id="aNs_${p}" style="color:#ffd400"></td></tr>`).join('')}
   </table>
   <button id="aVoiReset">Reset this box to the current crop</button> <button id="aVoiCopy">Copy this box to all planes</button>
+  <div style="margin-top:4px">Fit box to a structure: <select id="aVoiRoi"><option value="">Choose structure…</option>${rois.filter(r => r.ks.length).map(r => `<option value="${r.number}" ${A.voiRoi == r.number ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}</select>
+    &plusmn; <input type="number" id="aVoiMargin" min="0" max="200" value="${A.voiMargin ?? 15}"> mm
+    <button id="aVoiFit">Fit this box</button> <button id="aVoiFitAll">Fit all three boxes</button>
+    <small style="color:#999">Sagittal/coronal boxes are widened if needed so the structure's full height fits the page.</small></div>
   <div class="thumbs">${APLANES.map(p => `<div><canvas id="aTh_${p}"></canvas><br>${PNAME[p]}</div>`).join('')}</div>
 
   <h4>Scans</h4>
@@ -204,6 +230,16 @@ function atlasRender() {
   q('.aPlaneAll').forEach(x => x.onchange = e => { A.scans.forEach(s => s.planes[e.target.dataset.p] = e.target.checked); atlasRender(); });
   q('.aStep').forEach(x => x.oninput = e => { A.step[e.target.dataset.p] = Math.max(1, +e.target.value | 0); atlasCounts(); });
   $('aVoiReset').onclick = () => { A.voi[A.edit] = fitAspect(A.edit, {...(crop || fullCrop())}); refreshThumbImgs(); atlasCounts(); };
+  $('aVoiRoi').onchange = e => A.voiRoi = e.target.value;
+  $('aVoiMargin').oninput = e => A.voiMargin = +e.target.value;
+  const fitRoi = planes => {
+    const r = rois.find(x => x.number == A.voiRoi);
+    if (!r) { $('aVoiRoi').focus(); return; }
+    planes.forEach(p => A.voi[p] = voiForRoi(p, r, +(A.voiMargin ?? 15)));
+    refreshThumbImgs(); atlasCounts();
+  };
+  $('aVoiFit').onclick = () => fitRoi([A.edit]);
+  $('aVoiFitAll').onclick = () => fitRoi(APLANES);
   $('aVoiCopy').onclick = () => { const v = A.voi[A.edit]; APLANES.forEach(p => A.voi[p] = fitAspect(p, {...v})); atlasCounts(); };
   q('.aScan').forEach(x => x.onchange = e => { A.scans[+e.target.dataset.i].include = e.target.checked; atlasSummary(); });
   q('.aScanName').forEach(x => x.oninput = e => setAtlasName(A.scans[+e.target.dataset.i], e.target.value));
@@ -543,6 +579,25 @@ function titleBackdrop(pxW, pxH) {
   return out;
 }
 
+
+// ---------- navigation helpers ----------
+// page of the same slice in another section, or the nearest slice it has
+function pageNear(sec, idx, pageOf) {
+  const exact = pageOf[`${sec.s.key}|${sec.p}|${idx}`];
+  if (exact != null) return exact;
+  let best = null, bd = Infinity;
+  for (const i of sec.idxs) { const d = Math.abs(i - idx); if (d < bd) { bd = d; best = i; } }
+  return best == null ? null : pageOf[`${sec.s.key}|${sec.p}|${best}`];
+}
+// the same scan with/without dose in this plane (e.g. "CT" <-> "CT + dose")
+function doseTwin(sec, sections) {
+  const want = !pageHasDose(sec.s);
+  const c = sections.filter(x => x.p === sec.p && x !== sec && x.s.base === sec.s.base && pageHasDose(x.s) === want);
+  if (!c.length) return null;
+  const sameWin = c.filter(x => x.s.ww === sec.s.ww && x.s.wl === sec.s.wl);
+  const pick = (sameWin.length ? sameWin : c);
+  return pick.find(x => x.s.kind === 'pri') || pick.find(x => x.s.kind !== 'win' || x.s.dose) || pick[0];
+}
 // ---------- PDF ----------
 async function buildAtlas() {
   const A = atlas;
@@ -675,7 +730,9 @@ async function buildAtlas() {
         // header line 2: same slice on other scans | other planes of this scan
         let x = M;
         for (const t of [sec, ...others].sort((a, b) => A.scans.indexOf(a.s) - A.scans.indexOf(b.s)))
-          x += btn(x, 9, atlasName(t.s), pageOf[`${t.s.key}|${p}|${idx}`], t.s.key === s.key) + 1.5;
+          x += btn(x, 9, atlasName(t.s), t === sec ? here : pageNear(t, idx, pageOf), t.s.key === s.key) + 1.5;
+        const twin = doseTwin(sec, sections);
+        if (twin) { x += 2; x += btn(x, 9, pageHasDose(s) ? 'Hide dose' : 'Show dose', pageNear(twin, idx, pageOf), false) + 1.5; }
         let xr = PW - M;
         for (const q of [...APLANES].reverse()) {
           const os = secOf(s.key, q); if (!os) continue;
@@ -858,7 +915,9 @@ async function buildPptx() {
           {x: L.W * 0.45, y: 0.06, w: L.W * 0.55 - M, h: 0.24, fontFace: FONT, fontSize: 11, color: ACC, align: 'right', margin: 0});
         let x = M;
         for (const t of [sec, ...others].sort((a, b) => A.scans.indexOf(a.s) - A.scans.indexOf(b.s)))
-          x += btn(s, x, 0.33, atlasName(t.s), pageOf[`${t.s.key}|${p}|${idx}`], t.s.key === scan.key) + 0.06;
+          x += btn(s, x, 0.33, atlasName(t.s), t === sec ? here : pageNear(t, idx, pageOf), t.s.key === scan.key) + 0.06;
+        const twin = doseTwin(sec, sections);
+        if (twin) { x += 0.08; x += btn(s, x, 0.33, pageHasDose(scan) ? 'Hide dose' : 'Show dose', pageNear(twin, idx, pageOf), false) + 0.06; }
         let xr = L.W - M;
         for (const q of [...APLANES].reverse()) {
           const os = secOf(scan.key, q); if (!os) continue;
