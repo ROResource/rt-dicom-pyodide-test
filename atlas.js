@@ -75,6 +75,8 @@ function fitAspect(p, v, mode) {
   return v;
 }
 const atlasName = s => s.kind === 'win' ? s.name : scanName(s.key);
+const atlasDoseMode = () => !doseReady() ? 'off' : dose.mode === 'off' ? 'iso' : dose.mode;
+const pageHasDose = s => !!(s.dose && doseReady());
 function setAtlasName(s, v) {
   if (s.kind === 'win') s.name = v;
   else if (s.key === 'pri') { priName = v; $('name_pri').value = v; }
@@ -151,17 +153,20 @@ function atlasRender() {
   <div class="thumbs">${APLANES.map(p => `<div><canvas id="aTh_${p}"></canvas><br>${PNAME[p]}</div>`).join('')}</div>
 
   <h4>Scans</h4>
-  <table><tr><th>Include</th><th>Name in atlas</th><th>Type</th><th>W</th><th>L</th>${APLANES.map(p => `<th><label title="All scans"><input type="checkbox" class="aPlaneAll" data-p="${p}" ${A.scans.every(s => s.planes[p]) ? 'checked' : ''}> ${PNAME[p]}</label></th>`).join('')}<th></th></tr>
+  <table><tr><th>Include</th><th>Name in atlas</th><th>Type</th><th>W</th><th>L</th><th title="Overlay the dose as shown in the viewer">Dose</th>${APLANES.map(p => `<th><label title="All scans"><input type="checkbox" class="aPlaneAll" data-p="${p}" ${A.scans.every(s => s.planes[p]) ? 'checked' : ''}> ${PNAME[p]}</label></th>`).join('')}<th></th></tr>
   ${A.scans.map((s, i) => `<tr>
     <td><input type="checkbox" class="aScan" data-i="${i}" ${s.include ? 'checked' : ''}></td>
     <td><input type="text" class="aScanName" data-i="${i}" value="${esc(atlasName(s))}" style="width:200px"></td>
-    <td>${s.kind === 'pri' ? 'Primary CT' : s.kind === 'win' ? 'CT, other window' : (secs[s.key].status === 'UNREGISTERED' ? '<span style="color:#f88">unregistered</span>' : 'registered scan')}</td>
+    <td>${s.kind === 'pri' ? 'Primary CT' : s.kind === 'win' ? (s.dose ? 'CT with dose' : 'CT, other window') : (secs[s.key].status === 'UNREGISTERED' ? '<span style="color:#f88">unregistered</span>' : 'registered scan')}</td>
     <td><input type="number" class="aWW" data-i="${i}" value="${s.ww}"></td><td><input type="number" class="aWL" data-i="${i}" value="${s.wl}"></td>
+    <td><input type="checkbox" class="aDose" data-i="${i}" ${s.dose && doseReady() ? 'checked' : ''} ${doseReady() ? '' : 'disabled'}></td>
     ${APLANES.map(p => `<td><input type="checkbox" class="aSP" data-i="${i}" data-p="${p}" ${s.planes[p] ? 'checked' : ''}></td>`).join('')}
     <td>${s.kind === 'win' ? `<button class="aRmWin" data-i="${i}">Remove</button>` : ''}</td></tr>`).join('')}
   </table>
   Add the CT in another window: <select id="aWinPreset"><option value="Lung window|1600|-600">Lung 1600/-600</option><option value="Bone window|2000|300">Bone 2000/300</option><option value="Mediastinal window|350|40">Mediastinal 350/40</option><option value="Custom window|400|40">Custom</option></select>
   <button id="aAddWin">+ Add CT window</button>
+  &nbsp; <button id="aAddDose" ${doseReady() ? '' : 'disabled'} title="A separate copy of the CT with the dose and contours, in addition to the CT with contours">+ Add CT with dose</button>
+  ${doseReady() ? `<div style="color:#999;margin-top:4px">Dose is drawn as set in the viewer: ${atlasDoseMode() === 'wash' ? 'colourwash' : 'isolines'}, reference ${fmtGy(dose.ref)} Gy, levels in ${dose.units === 'rel' ? '%' : 'Gy'}.${dose.mode === 'off' ? ' (Dose display is off in the viewer, so pages use the isolines.)' : ''}</div>` : '<div style="color:#777;margin-top:4px">No dose loaded.</div>'}
 
   <h4>Structures</h4>
   <button id="aRoiAll">All</button><button id="aRoiNone">None</button><button id="aRoiVis">Match viewer</button>
@@ -205,6 +210,14 @@ function atlasRender() {
   q('.aWW').forEach(x => x.oninput = e => A.scans[+e.target.dataset.i].ww = +e.target.value);
   q('.aWL').forEach(x => x.oninput = e => A.scans[+e.target.dataset.i].wl = +e.target.value);
   q('.aSP').forEach(x => x.onchange = e => { A.scans[+e.target.dataset.i].planes[e.target.dataset.p] = e.target.checked; atlasRender(); });
+  q('.aDose').forEach(x => x.onchange = e => { A.scans[+e.target.dataset.i].dose = e.target.checked; });
+  $('aAddDose').onclick = () => {
+    const pri = A.scans[0], pos = A.scans.findIndex(s => s.kind === 'sec');
+    const n = A.scans.filter(s => s.kind === 'win' && s.dose).length + 1;
+    A.scans.splice(pos < 0 ? A.scans.length : pos, 0, {key: 'w' + Date.now(), base: 'pri', kind: 'win', name: `${scanName('pri')} + dose${n > 1 ? ' ' + n : ''}`,
+      include: true, planes: {...pri.planes}, ww: pri.ww, wl: pri.wl, dose: true});
+    atlasRender();
+  };
   q('.aRmWin').forEach(x => x.onclick = e => { A.scans.splice(+e.target.dataset.i, 1); atlasRender(); });
   $('aAddWin').onclick = () => {
     const [name, ww, wl] = $('aWinPreset').value.split('|');
@@ -424,21 +437,18 @@ function noteLayout(ctx, n, p, g, sx, sy, W, H) {
   const bw = tw + 2 * padX, bh = lines.length * lh + 2 * padY;
   let bx = (v.box.x - g.x0) * sx, by = (v.box.y - g.y0) * sy;
   bx = Math.max(0, Math.min(W - bw, bx)); by = Math.max(0, Math.min(H - bh, by));
-  const an = noteAnchor(n, p), ax = (an.x - g.x0) * sx, ay = (an.y - g.y0) * sy;
-  const px = Math.max(bx, Math.min(bx + bw, ax)), py_ = Math.max(by, Math.min(by + bh, ay));
-  return {fs, k, padX, padY, lh, lines, bx, by, bw, bh, ax, ay, px, py: py_};
+  const T = {X: x => (x - g.x0) * sx, Y: y => (y - g.y0) * sy, sx, sy}, box = {l: bx, t: by, w: bw, h: bh};
+  const mk = noteMarkerGeom(n, p, T, box);
+  return {fs, k, padX, padY, lh, lines, bx, by, bw, bh, T, box, mk};
 }
 function drawNoteOnCanvas(ctx, n, p, g, sx, sy, W, H) {
-  const {fs, k, padX, padY, lh, lines, bx, by, bw, bh, ax, ay, px, py: py_} = noteLayout(ctx, n, p, g, sx, sy, W, H);
-  ctx.font = `${fs}px system-ui, sans-serif`;
-  ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 1.5 * k;
-  ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(px, py_); ctx.stroke();
+  const {fs, k, padX, padY, lh, lines, bx, by, bw, bh, T, box} = noteLayout(ctx, n, p, g, sx, sy, W, H);
+  drawNoteMarker(ctx, n, p, T, box, k, false);
+  ctx.font = `${fs}px system-ui, sans-serif`; ctx.lineWidth = 1.5 * k;
   ctx.fillStyle = 'rgba(10,10,10,.82)'; ctx.fillRect(bx, by, bw, bh);
   ctx.strokeStyle = '#ffd400'; ctx.strokeRect(bx, by, bw, bh);
   ctx.fillStyle = '#fff'; ctx.textBaseline = 'top';
   lines.forEach((l, i) => ctx.fillText(l, bx + padX, by + padY + i * lh + (lh - fs) / 2));
-  ctx.fillStyle = '#ffd400'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1 * k;
-  ctx.beginPath(); ctx.arc(ax, ay, 4 * k, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
 }
 function notesOn(s, p, idx) {
   if (!atlas.notesOn) return [];
@@ -458,12 +468,13 @@ function renderAtlasImage(s, p, idx, W, H, opts) {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   ctx.drawImage(off, g.x0, g.y0, g.cw, g.ch, 0, 0, W, H);
   const sx = W / g.cw, sy = H / g.ch, X = x => (x - g.x0 + .5) * sx, Y = y => (y - g.y0 + .5) * sy;
-  ctx.lineWidth = Math.max(1, lineWidth * W / 760); ctx.lineJoin = 'round';
+  if (pageHasDose(s) && !(opts && opts.noDose)) drawDose(ctx, p, idx, g, sx, sy, W / 760, atlasDoseMode());
+  ctx.lineJoin = 'round';
   const present = [];
   const gIdx = {...g, idx};
   for (const r of rois) {
     if (!atlas.roiOn[r.number]) continue;
-    ctx.strokeStyle = `rgb(${r.color})`;
+    ctx.strokeStyle = `rgb(${r.color})`; ctx.lineWidth = Math.max(1, (r.lw ?? lineWidth) * W / 760);
     if (p === 'ax') {
       const cs = r.slices[idx]; if (!cs) continue;
       present.push(r);
@@ -513,7 +524,7 @@ function titleBackdrop(pxW, pxH) {
   let k = isFinite(lo) ? Math.round((lo + hi) / 2) : Math.round((v.k0 + v.k1) / 2);
   k = Math.max(v.k0, Math.min(v.k1, k));
   const ih = Math.round(pxH * 1.05), iw = Math.round(ih * g.mmW / g.mmH);
-  const {cv} = renderAtlasImage(pri, 'ax', k, iw, ih, {vectorNotes: true, noLabels: true});
+  const {cv} = renderAtlasImage(pri, 'ax', k, iw, ih, {vectorNotes: true, noLabels: true, noDose: true});
   const out = document.createElement('canvas'); out.width = pxW; out.height = pxH;
   const ctx = out.getContext('2d');
   ctx.fillStyle = '#111'; ctx.fillRect(0, 0, pxW, pxH);
@@ -675,9 +686,22 @@ async function buildAtlas() {
         const fy = PH - FOOT + 2;
         doc.setFontSize(7.5); doc.setFont('helvetica', 'normal');
         let kx = M;
+        // dose key goes on the right, structures fill the rest of the line
+        let dxr = PW - M;
+        if (pageHasDose(s)) {
+          const mode = atlasDoseMode(), items = doseLegendItems(mode);
+          for (const it of [...items].reverse()) {
+            const w = doc.getTextWidth(it.label) + 5; dxr -= w;
+            const c = unhex(it.color); doc.setFillColor(...c);
+            if (mode === 'wash') doc.rect(dxr, fy, 3, 3, 'F'); else doc.rect(dxr, fy + 1.1, 3.4, 0.8, 'F');
+            doc.setTextColor(...FG); doc.text(it.label, dxr + 4, fy + 2.6); dxr -= 2;
+          }
+          const lab = mode === 'wash' ? 'Dose:' : 'Isodose:'; dxr -= doc.getTextWidth(lab) + 1;
+          doc.setTextColor(...DIM); doc.text(lab, dxr, fy + 2.6); dxr -= 4;
+        }
         for (const r of present) {
           const w = doc.getTextWidth(r.name) + 6;
-          if (kx + w > PW - M) { doc.setTextColor(...DIM); doc.text('...', kx, fy + 2.8); break; }
+          if (kx + w > dxr) { doc.setTextColor(...DIM); doc.text('...', kx, fy + 2.8); break; }
           doc.setFillColor(...r.color); doc.rect(kx, fy, 3, 3, 'F');
           doc.setTextColor(...FG); doc.text(r.name, kx + 4, fy + 2.6); kx += w + 2;
         }
@@ -820,13 +844,8 @@ async function buildPptx() {
         const ns = notesOn(scan, p, idx);
         for (const n of ns) {
           const o = noteLayout(mctx, n, p, r.g, r.sx, r.sy, Wpx, Hpx);
-          const X = v => ix + v * in_px, Y = v => iy + v * in_px;
-          const dx = o.px - o.ax, dy = o.py - o.ay;
-          if (Math.hypot(dx, dy) > 1)
-            s.addShape(pptx.ShapeType.line, {x: X(Math.min(o.ax, o.px)), y: Y(Math.min(o.ay, o.py)), w: Math.abs(dx) * in_px, h: Math.abs(dy) * in_px,
-                       flipV: (dx >= 0) !== (dy >= 0), line: {color: ACC, width: 1.25}});
-          const rr = 4 * o.k * in_px;
-          s.addShape(pptx.ShapeType.ellipse, {x: X(o.ax) - rr, y: Y(o.ay) - rr, w: 2 * rr, h: 2 * rr, fill: {color: ACC}, line: {color: '000000', width: 0.75}});
+          const X = v => ix + v * in_px, Y = v => iy + v * in_px, m = o.mk;
+          pptMarker(s, pptx, m, X, Y, in_px, o.k, ACC);
           const pt = o.fs * in_px * 72;
           s.addText(n.text, {x: X(o.bx), y: Y(o.by), w: o.bw * in_px * 1.15, h: o.bh * in_px, fontFace: FONT, fontSize: Math.max(6, Math.round(pt * 10) / 10),
             color: 'FFFFFF', fill: {color: '0A0A0A', transparency: 18}, line: {color: ACC, width: 1}, valign: 'top',
@@ -845,10 +864,23 @@ async function buildPptx() {
           const os = secOf(scan.key, q); if (!os) continue;
           xr -= btn(s, xr, 0.33, PNAME[q], q === p ? here : os.first + Math.floor((os.last - os.first) / 2), q === p, true) + 0.06;
         }
-        // footer: structure key + navigation
-        if (r.present.length)
-          s.addText(r.present.flatMap(ro => [{text: '\u25A0 ', options: {color: hexc(ro.color)}}, {text: ro.name + '    ', options: {color: FG}}]),
-            {x: M, y: L.H - FOOT + 0.02, w: L.W - 2 * M, h: 0.2, fontFace: FONT, fontSize: 8, margin: 0});
+        // footer: structure key (+ dose key on the right) + navigation
+        const dItems = pageHasDose(scan) ? doseLegendItems(atlasDoseMode()) : [];
+        const dW = dItems.length ? Math.min(L.W * 0.45, 0.75 + dItems.reduce((a, it) => a + tw(it.label, 8) + 0.12, 0)) : 0;
+        if (r.present.length) {
+          const avail = L.W - 2 * M - dW - 0.3, shown = [];
+          let used = 0;
+          for (const ro of r.present) { const w = (ro.name.length + 6) * 8 * 0.0072; if (used + w > avail) break; shown.push(ro); used += w; }
+          const runs = shown.flatMap(ro => [{text: '\u25A0 ', options: {color: hexc(ro.color)}}, {text: ro.name + '    ', options: {color: FG}}]);
+          if (shown.length < r.present.length) runs.push({text: '\u2026', options: {color: DIM}});
+          s.addText(runs, {x: M, y: L.H - FOOT + 0.02, w: L.W - 2 * M - dW, h: 0.2, fontFace: FONT, fontSize: 8, margin: 0});
+        }
+        if (dItems.length) {
+          const wash = atlasDoseMode() === 'wash';
+          s.addText([{text: (wash ? 'Dose: ' : 'Isodose: '), options: {color: DIM}},
+                     ...dItems.flatMap(it => [{text: wash ? '\u25A0 ' : '\u2014 ', options: {color: it.color.slice(1).toUpperCase(), bold: true}}, {text: it.label + '  ', options: {color: FG}}])],
+            {x: L.W - M - dW, y: L.H - FOOT + 0.02, w: dW, h: 0.2, fontFace: FONT, fontSize: 8, margin: 0, align: 'right'});
+        }
         const ny = L.H - 0.3;
         let bx = M;
         bx += btn(s, bx, ny, 'Contents', 1, false) + 0.06;
@@ -880,4 +912,33 @@ async function buildPptx() {
   } catch (e) {
     $('aProgTxt').textContent = 'ERROR: ' + e; log('ERROR building PowerPoint: ' + e); console.error(e);
   } finally { $('aBuild').disabled = $('aBuildPpt').disabled = false; }
+}
+
+// a note marker as native PowerPoint shapes (m: noteMarkerGeom in output px; X/Y: px -> inches)
+function pptMarker(s, pptx, m, X, Y, in_px, k, ACC) {
+  const lineShape = (x1, y1, x2, y2, opt) => {
+    const dx = x2 - x1, dy = y2 - y1;
+    if (Math.hypot(dx, dy) < 1) return;
+    const flipV = (dx >= 0) !== (dy >= 0);
+    // PowerPoint draws the line top-left -> bottom-right (bottom-left -> top-right when flipped)
+    const endX = Math.max(x1, x2), endIs2 = dx !== 0 ? x2 === endX : (flipV ? y2 < y1 : y2 > y1);
+    const o = {x: X(Math.min(x1, x2)), y: Y(Math.min(y1, y2)), w: Math.abs(dx) * in_px, h: Math.abs(dy) * in_px, flipV, line: {color: ACC, width: 1.25}};
+    if (opt && opt.arrowAt1) o.line[endIs2 ? 'beginArrowType' : 'endArrowType'] = 'triangle';
+    s.addShape(pptx.ShapeType.line, o);
+  };
+  if (m.line) lineShape(m.sx, m.sy, m.bx, m.by, {arrowAt1: m.type === 'arrow'});
+  if (m.type === 'ellipse') {
+    s.addShape(pptx.ShapeType.ellipse, {x: X(m.ax - m.rx), y: Y(m.ay - m.ry), w: 2 * m.rx * in_px, h: 2 * m.ry * in_px,
+      fill: {color: 'FFFFFF', transparency: 100}, line: {color: ACC, width: 1.75}});
+  } else if (m.type === 'free' && m.pts && m.pts.length > 1) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const [x, y] of m.pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    const pts = m.pts.map(([x, y], j) => j ? {x: (x - x0) * in_px, y: (y - y0) * in_px} : {x: (x - x0) * in_px, y: (y - y0) * in_px, moveTo: true});
+    if (m.closed) pts.push({close: true});
+    s.addShape(pptx.ShapeType.custGeom, {x: X(x0), y: Y(y0), w: Math.max(0.01, (x1 - x0) * in_px), h: Math.max(0.01, (y1 - y0) * in_px), points: pts,
+      fill: {color: 'FFFFFF', transparency: 100}, line: {color: ACC, width: 1.75}});
+  } else if (m.type === 'dot' || (m.type === 'arrow' && !m.line)) {
+    const rr = 4 * k * in_px;
+    s.addShape(pptx.ShapeType.ellipse, {x: X(m.ax) - rr, y: Y(m.ay) - rr, w: 2 * rr, h: 2 * rr, fill: {color: ACC}, line: {color: '000000', width: 0.75}});
+  }
 }

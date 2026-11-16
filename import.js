@@ -21,7 +21,7 @@ $('patDir').onchange = async e => {
 async function scanFolder(files) {
   const hdr = py.globals.get('header');
   py.FS.mkdirTree('/data');
-  const series = {}, structs = [], regs = [], other = {};
+  const series = {}, structs = [], regs = [], doses = [], plans = [], other = {};
   let skipped = 0;
   const t0 = performance.now();
   for (let i = 0; i < files.length; i++) {
@@ -36,6 +36,8 @@ async function scanFolder(files) {
     if (!h.ok) { skipped++; }
     else if (h.mod === 'RTSTRUCT') structs.push({...h, file: f});
     else if (h.mod === 'REG') regs.push({...h, file: f});
+    else if (h.mod === 'RTDOSE') doses.push({...h, file: f});
+    else if (h.mod === 'RTPLAN') plans.push({...h, file: f});
     else if (['RTPLAN', 'RTDOSE', 'RTRECORD', 'SR', 'PR', 'KO', 'RTIMAGE'].includes(h.mod) || !h.plane) other[h.mod || '?'] = (other[h.mod || '?'] || 0) + 1;
     else {
       const s = series[h.series] || (series[h.series] = {...h, files: [], key: h.series});
@@ -59,11 +61,32 @@ async function scanFolder(files) {
   const cand = list.filter(s => s.key !== sel.pri && s.files.length >= 10)
     .sort((a, b) => (a.mod === 'MR' ? 0 : 1) - (b.mod === 'MR' ? 0 : 1) || (b.date + b.time).localeCompare(a.date + a.time));
   cand.slice(0, 4).forEach(s => sel.extra.add(s.key));
-  const out = {list, structs, regs, other, skipped, nFiles: files.length, sel};
+  const out = {list, structs, regs, doses, plans, other, skipped, nFiles: files.length, sel};
+  out.doseOpts = patDoseOptions(out);
   patDefaultRs(out);
   return out;
 }
+// dose choices: each plan-sum dose on its own, or all per-beam/other doses summed (grouped by frame of reference)
+function patDoseOptions(ps) {
+  const opts = [];
+  const planOf = d => ps.plans.find(p => p.sop === d.refPlan) || (ps.plans.length === 1 ? ps.plans[0] : null);
+  const label = (d, n) => { const pl = planOf(d); return `${pl && pl.label ? pl.label + ': ' : ''}${n}${pl && pl.dose ? ` (Rx ${(+pl.dose).toFixed(2)} Gy${pl.fx ? ' / ' + pl.fx + ' fx' : ''})` : ''}`; };
+  for (const d of ps.doses.filter(d => /PLAN/i.test(d.sum)))
+    opts.push({label: label(d, 'plan dose'), files: [d.file, ...(planOf(d) ? [planOf(d).file] : [])], FoR: d.FoR});
+  const rest = ps.doses.filter(d => !/PLAN/i.test(d.sum)), byFoR = {};
+  rest.forEach(d => (byFoR[d.FoR] = byFoR[d.FoR] || []).push(d));
+  for (const [f, ds] of Object.entries(byFoR))
+    opts.push({label: label(ds[0], ds.length > 1 ? `sum of ${ds.length} ${(ds[0].sum || 'dose').toLowerCase()} doses` : `${(ds[0].sum || '').toLowerCase()} dose`),
+               files: [...ds.map(d => d.file), ...(planOf(ds[0]) ? [planOf(ds[0]).file] : [])], FoR: f});
+  return opts;
+}
+function patDefaultDose(ps) {
+  const pri = ps.list.find(s => s.key === ps.sel.pri);
+  const i = ps.doseOpts.findIndex(o => pri && o.FoR === pri.FoR);
+  ps.sel.dose = i >= 0 ? i : (ps.doseOpts.length ? 0 : null);
+}
 function patDefaultRs(ps) {
+  patDefaultDose(ps);
   const pri = ps.list.find(s => s.key === ps.sel.pri);
   const ok = ps.structs.filter(st => pri && (st.refSeries.includes(pri.series) || st.refFoR.includes(pri.FoR)));
   ps.sel.rs = ok.length ? ps.structs.indexOf(ok[0]) : null;
@@ -90,6 +113,7 @@ const fmtDate = d => d && d.length === 8 ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${
 
 function patRender() {
   const ps = patScan, dlg = $('patDlg'), showDates = !$('anonChk').checked;
+  const priS = ps.list.find(s => s.key === ps.sel.pri);
   const otherTxt = Object.entries(ps.other).map(([k, v]) => `${v} ${k}`).join(', ');
   dlg.innerHTML = `<div class="panel">
   <h3 style="margin-top:0">Patient folder</h3>
@@ -112,6 +136,9 @@ function patRender() {
     const pri = ps.list.find(s => s.key === ps.sel.pri), fits = pri && (st.refSeries.includes(pri.series) || st.refFoR.includes(pri.FoR));
     return `<option value="${i}" ${ps.sel.rs === i ? 'selected' : ''}>${esc(st.label || '(no label)')}: ${st.nROI} structures${showDates && st.date ? ', ' + fmtDate(st.date) : ''}${fits ? '' : ' (not drawn on this primary)'}</option>`;
   }).join('')}</select>
+  <h4>Dose</h4>
+  ${ps.doseOpts.length ? `<select id="pDose"><option value="">None</option>${ps.doseOpts.map((o, i) => `<option value="${i}" ${ps.sel.dose === i ? 'selected' : ''}>${esc(o.label)}${priS && o.FoR !== priS.FoR ? ' (other frame of reference)' : ''}</option>`).join('')}</select>
+    <small>${ps.doses.length} RTDOSE file${ps.doses.length === 1 ? '' : 's'}, ${ps.plans.length} RTPLAN${ps.plans.length === 1 ? '' : 's'} (prescription is read from the plan).</small>` : 'No RTDOSE files found.'}
   <h4>Registrations</h4>
   ${ps.regs.length ? `All ${ps.regs.length} REG file${ps.regs.length > 1 ? 's are' : ' is'} loaded; scans registered to each other are chained back to the primary automatically.` : 'None found: only scans sharing the primary\'s frame of reference will line up.'}
   <div style="margin-top:14px;border-top:1px solid #333;padding-top:10px">
@@ -128,6 +155,7 @@ function patRender() {
     } else ps.sel.extra.delete(s.key);
   });
   $('pRs').onchange = e => ps.sel.rs = e.target.value === '' ? null : +e.target.value;
+  if ($('pDose')) $('pDose').onchange = e => ps.sel.dose = e.target.value === '' ? null : +e.target.value;
   $('pClose').onclick = () => dlg.style.display = 'none';
   $('pLoad').onclick = patLoad;
 }
@@ -148,6 +176,8 @@ async function patLoad() {
   }
   if (ps.regs.length) log(`Added ${ps.regs.length} registration file(s) from the folder.`);
   for (let i = 0; i < extras.length; i++) await loadSecondaryFrom(SLOT_IDS[i], extras[i].files, null);
+  let dTxt = '';
+  if (ps.sel.dose != null && ps.doseOpts[ps.sel.dose]) { if (await loadDoseFrom(ps.doseOpts[ps.sel.dose].files)) dTxt = ' + dose'; }
   current = 'pri'; buildImgSel(); draw(); renderNotesPanel();
-  log(`Patient folder loaded: primary + ${extras.length} extra scan(s).`);
+  log(`Patient folder loaded: primary + ${extras.length} extra scan(s)${dTxt}.`);
 }

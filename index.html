@@ -65,6 +65,19 @@
   #notesPanel .ni.here{border-left-color:#ffd400}
   #addNote.on{background:#ffd400;color:#111}
 .njp{color:#7cf;text-decoration:underline;cursor:pointer;margin:0 1px}
+  #dosePanel{font-size:13px}
+  #dosePanel .dinfo{color:#aaa;margin:3px 0}
+  #dosePanel .drow{margin:4px 0}
+  #dosePanel .bad{color:#f88}
+  #dosePanel input[type=number]{width:62px}
+  #dosePanel table.diso{border-collapse:collapse} #dosePanel .diso td,#dosePanel .diso th{padding:1px 4px;text-align:left;font-weight:normal;color:#aaa}
+  #dosePanel input[type=color]{width:28px;height:18px;padding:0;border:0;background:none}
+  #rois input.lwi{width:42px}
+  canvas.drawing{cursor:crosshair}
+  #mkMenu{position:absolute;z-index:20;background:#1d1d1d;border:1px solid #ffd400;border-radius:4px;font:12px/1.4 system-ui;color:#ddd;min-width:150px;line-height:normal;box-shadow:0 2px 8px rgba(0,0,0,.6)}
+  #mkMenu .mh{padding:3px 8px;color:#111;background:#ffd400;font-weight:bold}
+  #mkMenu .mi{padding:4px 10px;cursor:pointer} #mkMenu .mi:hover{background:#333} #mkMenu .mi.on{color:#ffd400}
+  #mkMenu .mhint{padding:3px 8px 5px;color:#999;font-size:11px;max-width:170px}
 </style>
 </head>
 <body>
@@ -113,6 +126,7 @@
 <div id="wrap">
   <div id="stage"><canvas id="cv"></canvas><div id="notesLayer"></div></div>
   <div id="side">
+    <div id="dosePanel"></div>
     <div id="notesPanel"></div>
     <div id="rois"></div>
   </div>
@@ -229,7 +243,7 @@ def header(path, truncated=False):
         mod = str(getattr(d, 'Modality', ''))
         if not mod and 'SOPClassUID' not in d:
             return json.dumps(dict(ok=False))
-        if truncated and mod in ('RTSTRUCT', 'REG'):
+        if truncated and mod in ('RTSTRUCT', 'REG', 'RTPLAN'):
             return json.dumps(dict(ok=False, need_full=True))
         o = dict(ok=True, mod=mod, series=str(getattr(d, 'SeriesInstanceUID', '')), desc=str(getattr(d, 'SeriesDescription', '')),
                  FoR=str(getattr(d, 'FrameOfReferenceUID', '')), date=str(getattr(d, 'SeriesDate', '') or getattr(d, 'StudyDate', '')),
@@ -254,6 +268,12 @@ def header(path, truncated=False):
                 f.append(str(it.SourceFrameOfReferenceUID))
             o['fors'] = sorted(set(x for x in f if x))
             o['deformable'] = 'DeformableRegistrationSequence' in d
+        elif mod == 'RTDOSE':
+            o['sum'] = str(getattr(d, 'DoseSummationType', ''))
+            try: o['refPlan'] = str(d.ReferencedRTPlanSequence[0].ReferencedSOPInstanceUID)
+            except Exception: o['refPlan'] = ''
+        elif mod == 'RTPLAN':
+            o.update(_plan_rx(d))
         elif 'ImageOrientationPatient' in d:
             o['plane'] = _plane_of(d.ImageOrientationPatient)
             o['rows'] = int(getattr(d, 'Rows', 0)); o['cols'] = int(getattr(d, 'Columns', 0))
@@ -646,6 +666,110 @@ def plane_rgba(view, i, ww, wl, which):
     if which != 'pri':   # tint area outside the secondary dark blue so coverage is visible
         m = np.isnan(a); rgba[m, 0] = 0; rgba[m, 1] = 0; rgba[m, 2] = 40
     return np.frombuffer(rgba.tobytes(), np.uint8)
+
+# ---------------- dose (RTDOSE) ----------------
+# The dose grid is held like a secondary scan (key 'dose') so it is resampled onto the primary planes with
+# the same trilinear code, and follows the same registration chain if it is in another frame of reference.
+def _plan_rx(d):
+    rx = None
+    for dr in getattr(d, 'DoseReferenceSequence', []):
+        v = dr.get('TargetPrescriptionDose', None)
+        if v not in (None, ''):
+            rx = max(rx or 0.0, float(v))
+    fx = None
+    for fg in getattr(d, 'FractionGroupSequence', []):
+        try: fx = int(fg.NumberOfFractionsPlanned)
+        except Exception: pass
+    return dict(dose=rx, fx=fx, label=str(getattr(d, 'RTPlanLabel', '') or ''))
+
+def load_dose(paths_json):
+    paths = json.loads(paths_json)
+    doses, plans, notes = [], [], []
+    for p in paths:
+        try:
+            d = read_dcm(p)
+        finally:
+            try: os.remove(p)
+            except Exception: pass
+        mod = str(getattr(d, 'Modality', ''))
+        if mod == 'RTDOSE' and 'PixelData' in d:
+            doses.append(d)
+        elif mod == 'RTPLAN':
+            plans.append(d)
+    if not doses:
+        raise ValueError('No RTDOSE file with dose data found')
+    def geo(d):
+        return (int(d.Rows), int(d.Columns), int(getattr(d, 'NumberOfFrames', 1) or 1),
+                tuple(round(float(x), 3) for x in d.ImagePositionPatient), tuple(round(float(x), 4) for x in d.PixelSpacing))
+    plan_type = [d for d in doses if str(getattr(d, 'DoseSummationType', '')).upper() in ('PLAN', 'MULTI_PLAN')]
+    if plan_type:
+        use = [plan_type[0]]
+        if len(plan_type) > 1:
+            notes.append(f'{len(plan_type)} plan doses found: using the first one.')
+    else:
+        # e.g. one file per beam: sum the ones sharing the first file's grid
+        g0 = geo(doses[0]); use = [d for d in doses if geo(d) == g0]
+        if len(use) > 1:
+            notes.append(f'No plan-sum dose: summed {len(use)} {str(getattr(use[0], "DoseSummationType", "")).lower() or "dose"} files on the same grid.')
+        if len(use) < len(doses):
+            notes.append(f'{len(doses) - len(use)} dose file(s) on a different grid were ignored.')
+    d0 = use[0]
+    arr = None
+    for d in use:
+        a = fix_meta(d).pixel_array.astype(np.float32) * float(getattr(d, 'DoseGridScaling', 1) or 1)
+        if a.ndim == 2:
+            a = a[None]
+        arr = a if arr is None else arr + a
+        del d.PixelData
+    iop = np.array(d0.ImageOrientationPatient, float)
+    row, col = iop[:3], iop[3:]
+    normal = np.cross(row, col)
+    ps = [float(x) for x in d0.PixelSpacing]
+    ipp = np.array(d0.ImagePositionPatient, float)
+    z0 = float(normal @ ipp)
+    offs = np.array([float(x) for x in getattr(d0, 'GridFrameOffsetVector', [0.0] * arr.shape[0])], float)
+    if len(offs) != arr.shape[0]:
+        offs = np.arange(arr.shape[0], dtype=float) * float(getattr(d0, 'SliceThickness', 1) or 1)
+    # relative offsets start at 0; absolute ones are the frame positions themselves
+    pos = offs if (abs(offs[0]) > 1e-6 and abs(offs[0] - z0) < 1e-3) else z0 + offs
+    order = np.argsort(pos); pos = pos[order]; arr = np.ascontiguousarray(arr[order])
+    gap = float(np.median(np.diff(pos))) if len(pos) > 1 else 1.0
+    A = np.eye(4)
+    A[:3, 0] = row * ps[1]; A[:3, 1] = col * ps[0]; A[:3, 2] = normal * gap
+    A[:3, 3] = ipp + normal * (pos[0] - z0)
+    dd = np.diff(pos)
+    S = dict(vol=arr, A=A, Ainv=np.linalg.inv(A), normal=normal, pos=pos, gap=gap,
+             uniform=bool(len(dd) == 0 or (dd.max() - dd.min()) < 0.05 * abs(gap)), cache={}, invert=False,
+             info=dict(modality='RTDOSE', series='Dose', FoR=str(getattr(d0, 'FrameOfReferenceUID', ''))))
+    SEC['dose'] = S
+    res = resolve_all().get('dose', {})
+    # hottest point, in primary voxel coordinates (for "jump to max")
+    k, r, c = np.unravel_index(int(np.argmax(arr)), arr.shape)
+    pat = np.linalg.inv(S['T']) @ (A @ np.array([c, r, k, 1.0]))
+    vox = np.linalg.inv(P['A']) @ pat
+    kk = float(np.interp(P['normal'] @ pat[:3], P['pos'], np.arange(len(P['pos']), dtype=float)))
+    # prescription: the plan this dose refers to, else the only plan given
+    rx = None
+    ref = ''
+    try: ref = str(d0.ReferencedRTPlanSequence[0].ReferencedSOPInstanceUID)
+    except Exception: pass
+    pl = [p for p in plans if str(getattr(p, 'SOPInstanceUID', '')) == ref] or (plans if len(plans) == 1 else [])
+    if pl:
+        rx = _plan_rx(pl[0])
+    info = dict(max=float(arr.max()), units=str(getattr(d0, 'DoseUnits', 'GY')), type=str(getattr(d0, 'DoseType', '')),
+                sum=str(getattr(d0, 'DoseSummationType', '')), nFiles=len(use), dims=list(arr.shape),
+                ps=ps, gap=round(gap, 3), status=res.get('status', ''), regNotes=res.get('notes', []), notes=notes,
+                maxAt=dict(c=float(vox[0]), r=float(vox[1]), k=kk), rx=rx, memoryMB=round(arr.nbytes / 1e6))
+    gc.collect()
+    return json.dumps(info)
+
+def dose_plane(view, i):
+    a = sec_plane('dose', view, i)
+    return np.frombuffer(np.nan_to_num(a, nan=-1.0).astype(np.float32).tobytes(), np.uint8)
+
+def remove_dose():
+    SEC.pop('dose', None); gc.collect()
+    return 'ok'
 `;
 const $ = id => document.getElementById(id);
 const log = m => { $('log').textContent += '\n' + m; $('log').scrollTop = 1e9; };
@@ -653,7 +777,9 @@ let py, meta = null, rois = [];
 let pos = {k: 0, r: 0, c: 0};          // cursor in primary voxel indices (slice, row, col)
 let crop = null;                        // {c0,c1,r0,r1,k0,k1} inclusive, primary voxel indices
 let lineWidth = 1.5, current = 'pri';
-const off = document.createElement('canvas');   // native-resolution plane image
+const off = document.createElement('canvas');   // native-resolution plane image (atlas rendering)
+const viewImg = {cv: document.createElement('canvas'), key: ''};   // viewer's plane image cache
+let imgGen = 0;                         // bumped when scans/registrations change
 const SLOT_IDS = ['s1', 's2', 's3', 's4'];
 let priName = 'CT';
 const scanName = id => id === 'pri' ? (priName || 'CT') : (secs[id] && secs[id].label) || id;
@@ -717,12 +843,14 @@ async function loadPrimaryFrom(ctFiles, rsFile) {
     const rsPath = await writeOne(rsFile, 'rs');
     const res = JSON.parse(py.globals.get('load')(rsPath));
     meta = res.info;
-    rois = res.rois.map(r => ({...r, origName: r.name, visible: true,
+    rois = res.rois.map(r => ({...r, origName: r.name, visible: true, lw: lineWidth,
       ks: Object.keys(r.slices).map(Number).sort((a, b) => a - b)}));
     log(`Primary parsed in ${((performance.now()-t)/1000).toFixed(1)} s\n` + JSON.stringify(meta));
     pos = {k: Math.floor(meta.n / 2), r: Math.floor(meta.rows / 2), c: Math.floor(meta.cols / 2)};
     crop = null; current = 'pri';
-    notes = []; pruneNoteEls(); noteMode = null; renderNotesPanel();
+    notes = []; pruneNoteEls(); noteMode = null; activeNote = null; closeMkMenu(); renderNotesPanel();
+    if (typeof dose !== 'undefined' && dose) { py.globals.get('remove_dose')(); dose = null; }
+    imgGen++; if (typeof renderDosePanel === 'function') renderDosePanel();
     if (typeof atlas !== 'undefined') atlas = null;
     initSlots();
     buildRoiPanel();
@@ -782,6 +910,7 @@ async function loadSecondaryFrom(id, files, regFile) {
   } catch (e) { log('ERROR: ' + e); console.error(e); return false; }
 }
 function removeSecondary(id) {
+  imgGen++;
   if (secs[id].loaded) applyResolve(JSON.parse(py.globals.get('remove_secondary')(id)));
   Object.assign(secs[id], {loaded: false, label: '', status: ''});
   $('lab_' + id).textContent = ''; $('st_' + id).textContent = ''; $('nmw_' + id).style.display = 'none';
@@ -795,6 +924,8 @@ function removeSecondary(id) {
 }
 // registration status for every loaded scan (adding a REG can link scans loaded earlier)
 function applyResolve(all) {
+  imgGen++;
+  if (typeof doseInvalidate === 'function') { doseInvalidate(); if (all.dose && dose && dose.info) dose.info.status = all.dose.status; }
   for (const id of SLOT_IDS) {
     const st = $('st_' + id), r = all[id];
     if (!r) continue;
@@ -830,7 +961,7 @@ $('name_pri').oninput = e => { priName = e.target.value; buildImgSel(); draw(); 
 // A note belongs to one scan. Its dot is a single 3D point in the primary grid, so it can be shown on
 // any plane; the "home" plane is where it was created, and each plane it is shown on keeps its own box.
 // pt.c / pt.r: continuous column/row (pixel-edge based, like the canvas); pt.k: continuous slice index.
-let notes = [], noteSeq = 1, noteMode = null, pending = null, suppressClick = false;
+let notes = [], noteSeq = 1, noteMode = null, pending = null, suppressClick = 0;
 let view2css = null;                    // {g, kx, ky}: native px -> css px for the current draw
 const noteEls = new Map();              // note id -> DOM element
 const PLANE_NAME = {ax: 'Axial', sag: 'Sagittal', cor: 'Coronal'};
@@ -855,10 +986,131 @@ function defaultNoteBox(n, p) {
 }
 function setNoteView(n, p, on) {
   if (!on && Object.entries(n.views).filter(([q, v]) => v.on && q !== p).length === 0) return false;   // keep at least one
-  if (!n.views[p]) n.views[p] = {on, box: defaultNoteBox(n, p)};
+  if (!n.views[p]) n.views[p] = {on, box: defaultNoteBox(n, p), mk: inheritMk(n, p)};
   n.views[p].on = on;
   return true;
 }
+
+// ---------- note markers: dot, arrow, circle/ellipse, free draw ----------
+// Stored per plane in n.views[p].mk, in native plane pixels relative to the note's anchor point:
+// ellipse {rx, ry}; free {pts: [[dx, dy], ...], closed}.
+const MK_TYPES = [['dot', '\u25CF Dot'], ['arrow', '\u27A4 Arrow'], ['ellipse', '\u25EF Circle / ellipse'], ['free', '\u270E Free draw']];
+let activeNote = null, freeDraw = null, mkMenuFor = null;
+const noteMk = (n, p) => (n.views[p] && n.views[p].mk) || {type: 'dot'};
+function mkRadiusMm(n, q) {                // rough size of a marker in mm (to carry it to another plane)
+  const mk = noteMk(n, q), g = planeGeom(q);
+  if (mk.type === 'ellipse') return (mk.rx * g.psx + mk.ry * g.psy) / 2;
+  if (mk.type === 'free' && mk.pts && mk.pts.length) return mk.pts.reduce((a, [u, v]) => a + Math.hypot(u * g.psx, v * g.psy), 0) / mk.pts.length;
+  return 8;
+}
+function circleMk(p, rMm) { const g = planeGeom(p); return {type: 'ellipse', rx: rMm / g.psx, ry: rMm / g.psy}; }
+function inheritMk(n, p) {
+  const h = noteMk(n, n.home);
+  if (h.type === 'ellipse' || h.type === 'free') return circleMk(p, mkRadiusMm(n, n.home));
+  return {type: h.type};
+}
+// Marker geometry on a canvas. T: {X, Y, sx, sy} native -> canvas; box {l, t, w, h} in canvas px.
+// Returns the anchor (ax, ay), the leader line (from s to b) and shape data in canvas px.
+function noteMarkerGeom(n, p, T, box) {
+  const mk = noteMk(n, p), an = noteAnchor(n, p), ax = T.X(an.x), ay = T.Y(an.y);
+  const clampB = (x, y) => [Math.max(box.l, Math.min(box.l + box.w, x)), Math.max(box.t, Math.min(box.t + box.h, y))];
+  let [bx, by] = clampB(ax, ay), sx = ax, sy = ay, line = true;
+  const o = {type: mk.type, ax, ay};
+  if (mk.type === 'ellipse') {
+    o.rx = Math.max(1, mk.rx * T.sx); o.ry = Math.max(1, mk.ry * T.sy);
+    const dx = bx - ax, dy = by - ay, q = Math.hypot(dx / o.rx, dy / o.ry);
+    if (q <= 1) line = false; else { sx = ax + dx / q; sy = ay + dy / q; }
+  } else if (mk.type === 'free' && mk.pts && mk.pts.length) {
+    o.pts = mk.pts.map(([u, v]) => [T.X(an.x + u), T.Y(an.y + v)]); o.closed = !!mk.closed;
+    let best = Infinity;
+    for (const [x, y] of o.pts) { const d = (x - bx) ** 2 + (y - by) ** 2; if (d < best) { best = d; sx = x; sy = y; } }
+    [bx, by] = clampB(sx, sy);
+  }
+  if (Math.hypot(bx - sx, by - sy) < 0.5) line = false;
+  return Object.assign(o, {line, sx, sy, bx, by});
+}
+// k: canvas px per CSS px (line widths); handles: draw edit handles (viewer only)
+function drawNoteMarker(ctx, n, p, T, box, k, handles) {
+  const o = noteMarkerGeom(n, p, T, box), Y = '#ffd400';
+  ctx.save(); ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  if (o.line) { ctx.strokeStyle = Y; ctx.lineWidth = 1.5 * k; ctx.beginPath(); ctx.moveTo(o.sx, o.sy); ctx.lineTo(o.bx, o.by); ctx.stroke(); }
+  const twoTone = path => {        // dark halo under the yellow line so it shows on any background
+    ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 3.6 * k; path(); ctx.stroke();
+    ctx.strokeStyle = Y; ctx.lineWidth = 2 * k; path(); ctx.stroke();
+  };
+  if (o.type === 'ellipse') twoTone(() => { ctx.beginPath(); ctx.ellipse(o.ax, o.ay, o.rx, o.ry, 0, 0, 2 * Math.PI); });
+  else if (o.type === 'free' && o.pts) twoTone(() => { ctx.beginPath(); o.pts.forEach(([x, y], j) => j ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); if (o.closed) ctx.closePath(); });
+  else if (o.type === 'arrow') {
+    let dx = o.ax - o.bx, dy = o.ay - o.by, L = Math.hypot(dx, dy);
+    if (L < 1) { dx = 1; dy = 1; L = Math.SQRT2; }
+    dx /= L; dy /= L;
+    const len = 12 * k, wd = 5 * k, bx = o.ax - dx * len, by = o.ay - dy * len;
+    ctx.beginPath(); ctx.moveTo(o.ax, o.ay); ctx.lineTo(bx - dy * wd, by + dx * wd); ctx.lineTo(bx + dy * wd, by - dx * wd); ctx.closePath();
+    ctx.fillStyle = Y; ctx.fill(); ctx.strokeStyle = '#000'; ctx.lineWidth = 0.8 * k; ctx.stroke();
+  } else {
+    ctx.fillStyle = Y; ctx.strokeStyle = '#000'; ctx.lineWidth = 1 * k;
+    ctx.beginPath(); ctx.arc(o.ax, o.ay, 4 * k, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+  }
+  if (handles && (o.type === 'ellipse' || o.type === 'free')) {
+    const hs = [[o.ax, o.ay]];
+    if (o.type === 'ellipse') hs.push([o.ax + o.rx, o.ay], [o.ax, o.ay - o.ry]);
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1 * k;
+    for (const [x, y] of hs) { ctx.fillRect(x - 3.5 * k, y - 3.5 * k, 7 * k, 7 * k); ctx.strokeRect(x - 3.5 * k, y - 3.5 * k, 7 * k, 7 * k); }
+  }
+  ctx.restore();
+  return o;
+}
+// what is under the mouse (CSS px) for note n on the viewer: 'rx' | 'ry' | 'move' | null
+function hitMarker(n, p, mx, my) {
+  const {g, kx, ky} = view2css, el = noteEls.get(n.id);
+  const T = {X: x => (x - g.x0) * kx, Y: y => (y - g.y0) * ky, sx: kx, sy: ky};
+  const box = el ? {l: el.offsetLeft, t: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight} : {l: 0, t: 0, w: 0, h: 0};
+  const o = noteMarkerGeom(n, p, T, box), near = (x, y, r) => Math.hypot(x - mx, y - my) < r;
+  if (o.type === 'ellipse') {
+    if (n === activeNote && near(o.ax + o.rx, o.ay, 7)) return 'rx';
+    if (n === activeNote && near(o.ax, o.ay - o.ry, 7)) return 'ry';
+    const q = Math.hypot((mx - o.ax) / o.rx, (my - o.ay) / o.ry);
+    if (near(o.ax, o.ay, 8) || Math.abs(q - 1) * Math.min(o.rx, o.ry) < 6) return 'move';
+    return null;
+  }
+  if (o.type === 'free' && o.pts) {
+    if (near(o.ax, o.ay, 8)) return 'move';
+    const P = o.pts, m = P.length, segs = o.closed ? m : m - 1;
+    for (let j = 0; j < segs; j++) {
+      const [x1, y1] = P[j], [x2, y2] = P[(j + 1) % m], dx = x2 - x1, dy = y2 - y1, L2 = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, ((mx - x1) * dx + (my - y1) * dy) / L2));
+      if (near(x1 + t * dx, y1 + t * dy, 6)) return 'move';
+    }
+    return null;
+  }
+  return near(o.ax, o.ay, 9) ? 'move' : null;
+}
+// small menu next to the marker
+function openMkMenu(n, p, cssX, cssY) {
+  closeMkMenu();
+  activeNote = n; mkMenuFor = {n, p};
+  const m = document.createElement('div'); m.id = 'mkMenu';
+  const cur = noteMk(n, p).type;
+  m.innerHTML = `<div class="mh">Marker (${PLANE_NAME[p]})</div>` + MK_TYPES.map(([t, l]) => `<div class="mi ${t === cur ? 'on' : ''}" data-t="${t}">${l}</div>`).join('') +
+    (cur === 'ellipse' ? '<div class="mhint">Drag the white squares to resize, the outline to move.</div>' : cur === 'free' ? '<div class="mhint">Drag the outline to move it.</div>' : '');
+  m.style.left = (cssX + 12) + 'px'; m.style.top = (cssY + 6) + 'px';
+  m.addEventListener('mousedown', e => e.stopPropagation());
+  m.querySelectorAll('.mi').forEach(d => d.onclick = () => {
+    const t = d.dataset.t, v = n.views[p];
+    if (t === 'free') { closeMkMenu(); startFreeDraw(n, p); return; }
+    if (t === 'ellipse') v.mk = cur === 'ellipse' ? v.mk : circleMk(p, cur === 'free' ? mkRadiusMm(n, p) : 8);
+    else v.mk = {type: t};
+    closeMkMenu(); activeNote = n; draw();
+  });
+  $('stage').appendChild(m);
+}
+function closeMkMenu() { const m = $('mkMenu'); if (m) m.remove(); mkMenuFor = null; }
+function startFreeDraw(n, p) {
+  freeDraw = {n, p, pts: null}; activeNote = n;
+  $('cv').classList.add('drawing');
+  log('Free draw: drag on the image to draw the outline (Esc cancels).');
+}
+function endFreeDraw() { freeDraw = null; $('cv').classList.remove('drawing'); }
 
 function toNativeF(e) {                 // continuous native-plane coords (pixel-edge based)
   const g = planeGeom(radio('plane')), rect = $('cv').getBoundingClientRect();
@@ -882,7 +1134,7 @@ function noteClick(e) {
     const n = {id: noteSeq++, scan: curWhich(), home: p, pt: {c: 0, r: 0, k: 0}, text: '', views: {}};
     if (p === 'ax') n.pt.k = g.idx; else if (p === 'sag') n.pt.c = g.idx + 0.5; else n.pt.r = g.idx + 0.5;
     setNoteAnchor(n, p, a);
-    n.views[p] = {on: true, box: defaultNoteBox(n, p)};
+    n.views[p] = {on: true, box: defaultNoteBox(n, p), mk: {type: 'dot'}};
     pending = n; notes.push(n); noteMode = 'box';
     $('addNote').textContent = 'Now click where the text box goes…';
     draw(); return true;
@@ -922,7 +1174,7 @@ function noteEl(n) {
   el.addEventListener('mousedown', e => {
     if (el.classList.contains('editing') && e.target === tx) return;   // while editing, allow text selection
     e.preventDefault();
-    const v = n.views[radio('plane')];
+    const v = n.views[radio('plane')]; closeMkMenu();
     dragNote = {n, what: 'box', v, x: e.clientX, y: e.clientY, bx: v.box.x, by: v.box.y, moved: false, el: tx};
   });
   $('notesLayer').appendChild(el); noteEls.set(n.id, el);
@@ -934,6 +1186,7 @@ function focusEnd(tx) {
   const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
 }
 function pruneNoteEls() {
+  if (activeNote && !notes.includes(activeNote)) { activeNote = null; closeMkMenu(); }
   const ids = new Set(notes.map(n => n.id));
   for (const [id, el] of noteEls) if (!ids.has(id)) { el.remove(); noteEls.delete(id); }
 }
@@ -959,13 +1212,8 @@ function renderNotes(p, g, which, ctx, cssW, cssH, dpr) {
       l = lc; t = tc; el.style.left = l + 'px'; el.style.top = t + 'px';
       if (!dragNote || dragNote.n !== n) v.box = {x: g.x0 + l / kx, y: g.y0 + t / ky};
     }
-    const px = Math.max(l, Math.min(l + w, ax)), py = Math.max(t, Math.min(t + h, ay));
-    ctx.save();
-    ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 1.5 * dpr;
-    ctx.beginPath(); ctx.moveTo(ax * dpr, ay * dpr); ctx.lineTo(px * dpr, py * dpr); ctx.stroke();
-    ctx.fillStyle = '#ffd400'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1 * dpr;
-    ctx.beginPath(); ctx.arc(ax * dpr, ay * dpr, 4 * dpr, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
-    ctx.restore();
+    const T = {X: x => (x - g.x0) * kx * dpr, Y: y => (y - g.y0) * ky * dpr, sx: kx * dpr, sy: ky * dpr};
+    drawNoteMarker(ctx, n, p, T, {l: l * dpr, t: t * dpr, w: w * dpr, h: h * dpr}, dpr, n === activeNote);
   }
 }
 function renderNotesPanel() {
@@ -975,7 +1223,7 @@ function renderNotesPanel() {
   const sorted = [...notes].sort((a, b) => a.scan.localeCompare(b.scan) || a.home.localeCompare(b.home) || noteIdx(a, a.home) - noteIdx(b, b.home));
   const nHere = notes.filter(n => noteShown(n, p, g.idx, which)).length;
   el.innerHTML = `<b>Notes</b> <small>(${notes.length} total, ${nHere} on this slice)</small><br>
-    <button id="addNote">+ Add note</button> <small>Click a box to edit (tick "Show on" planes above it), drag it or its dot to move. Esc finishes.</small>
+    <button id="addNote">+ Add note</button> <small>Click a box to edit (tick "Show on" planes above it); drag a box or marker to move it. Click a marker to change it (dot, arrow, circle/ellipse, free draw). Esc finishes.</small>
     <div class="nl">${sorted.map(n => {
       const planes = ['ax', 'sag', 'cor'].filter(q => n.views[q] && n.views[q].on).map(q => `<a class="njp" data-p="${q}" title="Show on ${PLANE_NAME[q]}">${PLANE_SHORT[q]}</a>`).join(' ');
       return `<div class="ni ${noteShown(n, p, g.idx, which) ? 'here' : ''}" data-id="${n.id}">${esc(scanName(n.scan))} · ${PLANE_NAME[n.home]} ${noteIdx(n, n.home) + 1} <small>(${planes})</small>: <span style="color:#aaa">${esc((n.text || '(empty)').slice(0, 60))}</span></div>`;
@@ -994,46 +1242,91 @@ function jumpToNote(n, plane) {
   if (!inside) setCrop(fullCrop(), 'Full (note was outside crop)');
   buildImgSel(); syncSlider(); draw(); renderNotesPanel();
 }
-// drag a note's box or its anchor dot
+// drag a note's box, its marker (move / resize), free drawing; click on a marker opens its menu
 let dragNote = null;
 $('cv').addEventListener('mousedown', e => {
   if (!meta || cropMode || noteMode || !view2css) return;
   const rect = $('cv').getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
-  const {g, kx, ky} = view2css, p = radio('plane'), which = curWhich();
-  const hit = notes.find(n => { if (!noteShown(n, p, g.idx, which)) return false;
-    const a = noteAnchor(n, p); return Math.hypot((a.x - g.x0) * kx - mx, (a.y - g.y0) * ky - my) < 8; });
-  if (hit) { e.preventDefault(); dragNote = {n: hit, what: 'anchor', p}; }
+  const p = radio('plane'), which = curWhich(), {g} = view2css;
+  if (freeDraw) {
+    if (freeDraw.p !== p) { endFreeDraw(); return; }
+    e.preventDefault(); freeDraw.pts = [toNativeF(e)]; return;
+  }
+  closeMkMenu();
+  const here = notes.filter(n => noteShown(n, p, g.idx, which));
+  // the active note first, so its handles win
+  here.sort((a, b) => (b === activeNote) - (a === activeNote));
+  for (const n of here) {
+    const h = hitMarker(n, p, mx, my);
+    if (!h) continue;
+    e.preventDefault();
+    dragNote = {n, what: h, p, x: e.clientX, y: e.clientY, mx, my, start: toNativeF(e), a0: noteAnchor(n, p), moved: false};
+    return;
+  }
 });
 window.addEventListener('mousemove', e => {
   if (noteMode === 'box' && pending && e.target === $('cv')) { pending.views[radio('plane')].box = toNativeF(e); draw(); return; }
+  if (freeDraw && freeDraw.pts) {
+    const a = toNativeF(e), l = freeDraw.pts[freeDraw.pts.length - 1], {kx, ky} = view2css;
+    if (Math.hypot((a.x - l.x) * kx, (a.y - l.y) * ky) >= 2) { freeDraw.pts.push(a); drawFreePreview(); }
+    return;
+  }
   if (!dragNote || !view2css) return;
   const {kx, ky} = view2css, d = dragNote;
-  if (d.what === 'box') {
-    if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;
-    d.moved = true;
-    d.v.box = {x: d.bx + (e.clientX - d.x) / kx, y: d.by + (e.clientY - d.y) / ky};
+  if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;
+  d.moved = true;
+  if (d.what === 'box') d.v.box = {x: d.bx + (e.clientX - d.x) / kx, y: d.by + (e.clientY - d.y) / ky};
+  else {
+    const a = toNativeF(e), mk = noteMk(d.n, d.p);
+    if (d.what === 'rx') mk.rx = Math.max(1, Math.abs(a.x - d.a0.x));
+    else if (d.what === 'ry') mk.ry = Math.max(1, Math.abs(a.y - d.a0.y));
+    else setNoteAnchor(d.n, d.p, {x: d.a0.x + a.x - d.start.x, y: d.a0.y + a.y - d.start.y});
   }
-  else setNoteAnchor(d.n, d.p, toNativeF(e));
   draw();
 });
-window.addEventListener('mouseup', () => {
+window.addEventListener('mouseup', e => {
+  if (freeDraw && freeDraw.pts) { finishFreeDraw(); return; }
   if (!dragNote) return;
   const d = dragNote; dragNote = null;
-  if (d.what === 'anchor') { suppressClick = true; renderNotesPanel(); }
-  if (d.what === 'box' && !d.moved) { focusEnd(d.el); return; }
-  draw();
+  if (d.what === 'box') { activeNote = d.n; if (!d.moved) { focusEnd(d.el); return; } draw(); return; }
+  suppressClick = performance.now();
+  activeNote = d.n;
+  if (!d.moved) openMkMenu(d.n, d.p, d.mx, d.my);
+  renderNotesPanel(); draw();
 });
+function drawFreePreview() {
+  draw();
+  const {g, kx, ky} = view2css, ctx = $('cv').getContext('2d'), dpr = window.devicePixelRatio || 1;
+  ctx.save(); ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 2 * dpr; ctx.lineJoin = ctx.lineCap = 'round';
+  ctx.beginPath(); freeDraw.pts.forEach((a, j) => { const x = (a.x - g.x0) * kx * dpr, y = (a.y - g.y0) * ky * dpr; j ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke(); ctx.restore();
+}
+function finishFreeDraw() {
+  const {n, p, pts} = freeDraw; endFreeDraw(); suppressClick = performance.now();
+  if (pts.length < 3) { draw(); return; }
+  const {kx, ky} = view2css;
+  let cx = 0, cy = 0; pts.forEach(a => { cx += a.x; cy += a.y; }); cx /= pts.length; cy /= pts.length;
+  const closed = Math.hypot((pts[0].x - pts[pts.length - 1].x) * kx, (pts[0].y - pts[pts.length - 1].y) * ky) < 15;
+  // thin out to at most ~150 points
+  const step = Math.max(1, Math.ceil(pts.length / 150));
+  const keep = pts.filter((_, j) => j % step === 0 || j === pts.length - 1);
+  setNoteAnchor(n, p, {x: cx, y: cy});
+  const an = noteAnchor(n, p);
+  n.views[p].mk = {type: 'free', closed, pts: keep.map(a => [+(a.x - an.x).toFixed(2), +(a.y - an.y).toFixed(2)])};
+  activeNote = n; renderNotesPanel(); draw();
+}
 
 // ---------- structure panel ----------
 function buildRoiPanel() {
   const el = $('rois');
   el.innerHTML = `<b>${rois.length} structures</b><br>
     <button id="allOn">All on</button><button id="allOff">All off</button>
-    &nbsp; Line width <input type="range" id="lw" min="0.5" max="5" step="0.5" value="${lineWidth}" style="width:90px"> <span id="lwv">${lineWidth}</span>
+    &nbsp; Line width, all: <input type="range" id="lw" min="0.5" max="5" step="0.5" value="${lineWidth}" style="width:90px"> <span id="lwv">${lineWidth}</span>
     <table>${rois.map((r, i) => `<tr>
       <td><input type="checkbox" data-i="${i}" class="vis" ${r.visible ? 'checked' : ''}></td>
       <td><input type="color" data-i="${i}" class="col" value="${hex(r.color)}"></td>
       <td><input type="text" data-i="${i}" class="nm" value="${esc(r.name)}" title="Original: ${esc(r.origName)}"></td>
+      <td><input type="number" data-i="${i}" class="lwi" min="0.5" max="6" step="0.5" value="${r.lw ?? lineWidth}" title="Line width for this structure"></td>
       <td><small>${r.nContours} contours</small></td>
       <td><button data-i="${i}" class="go" title="Jump to centre slice">&#8982;</button></td></tr>`).join('')}</table>`;
   el.querySelectorAll('.vis').forEach(x => x.onchange = e => { rois[+e.target.dataset.i].visible = e.target.checked; draw(); });
@@ -1051,7 +1344,8 @@ function buildRoiPanel() {
     clampPos(); syncSlider(); draw();
   });
   $('allOn').onclick = () => setAll(true); $('allOff').onclick = () => setAll(false);
-  $('lw').oninput = e => { lineWidth = +e.target.value; $('lwv').textContent = lineWidth; draw(); };
+  $('lw').oninput = e => { lineWidth = +e.target.value; $('lwv').textContent = lineWidth; rois.forEach(r => r.lw = lineWidth); el.querySelectorAll('.lwi').forEach(x => x.value = lineWidth); draw(); };
+  el.querySelectorAll('.lwi').forEach(x => x.oninput = e => { const v = +e.target.value; if (v > 0) { rois[+e.target.dataset.i].lw = v; draw(); } });
 }
 function setAll(v) { rois.forEach(r => r.visible = v); $('rois').querySelectorAll('.vis').forEach(x => x.checked = v); draw(); }
 
@@ -1159,10 +1453,14 @@ function draw(overlay) {
   const p = radio('plane'), g = planeGeom(p);
   const which = secs[current] && secs[current].loaded ? current : 'pri';
   const [ww, wl] = which !== 'pri' ? [secs[which].ww, secs[which].wl] : $('wl').value.split(',').map(Number);
-  const proxy = py.globals.get('plane_rgba')(p, g.idx, ww, wl, which);
-  const buf = proxy.toJs(); proxy.destroy();
-  off.width = g.w; off.height = g.h;
-  off.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(buf.buffer, buf.byteOffset, buf.length), g.w, g.h), 0, 0);
+  const ikey = `${imgGen}|${p}|${g.idx}|${ww}|${wl}|${which}|${g.w}x${g.h}`;
+  if (viewImg.key !== ikey) {          // only ask Python for a new plane when something changed
+    const proxy = py.globals.get('plane_rgba')(p, g.idx, ww, wl, which);
+    const buf = proxy.toJs(); proxy.destroy();
+    viewImg.cv.width = g.w; viewImg.cv.height = g.h;
+    viewImg.cv.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(buf.buffer, buf.byteOffset, buf.length), g.w, g.h), 0, 0);
+    viewImg.key = ikey;
+  }
 
   const dpr = window.devicePixelRatio || 1;
   const maxW = Math.min(window.innerWidth - 380, 760), maxH = window.innerHeight * 0.8;
@@ -1173,14 +1471,15 @@ function draw(overlay) {
   cv.width = cssW * dpr; cv.height = cssH * dpr;
   const ctx = cv.getContext('2d');
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(off, g.x0, g.y0, g.cw, g.ch, 0, 0, cv.width, cv.height);
+  ctx.drawImage(viewImg.cv, g.x0, g.y0, g.cw, g.ch, 0, 0, cv.width, cv.height);
   const sx = cv.width / g.cw, sy = cv.height / g.ch;
+  if (typeof drawDose === 'function') drawDose(ctx, p, g.idx, g, sx, sy, dpr);
   const X = x => (x - g.x0 + .5) * sx, Y = y => (y - g.y0 + .5) * sy;   // pixel-centre coords -> canvas
   ctx.lineWidth = lineWidth * dpr; ctx.lineJoin = 'round';
 
   for (const r of rois) {
     if (!r.visible) continue;
-    ctx.strokeStyle = `rgb(${r.color})`;
+    ctx.strokeStyle = `rgb(${r.color})`; ctx.lineWidth = (r.lw ?? lineWidth) * dpr;
     if (p === 'ax') {
       const cs = r.slices[pos.k]; if (!cs) continue;
       for (const c of cs) {
@@ -1213,6 +1512,7 @@ function draw(overlay) {
     ctx.restore();
   }
   renderNotes(p, g, which, ctx, cssW, cssH, dpr);
+  if (typeof drawDoseKey === 'function') drawDoseKey(ctx, cv, dpr);
   ctx.fillStyle = '#ff0'; ctx.font = `${12 * dpr}px system-ui`;
   const names = {ax: 'AXIAL', sag: 'SAGITTAL', cor: 'CORONAL'};
   ctx.fillText(`${names[p]} · ${scanName(which)}${which === 'pri' ? ' (primary)' : secs[which].status === 'UNREGISTERED' ? ' — UNREGISTERED' : ' (registered)'}`, 6 * dpr, 16 * dpr);
@@ -1251,8 +1551,9 @@ window.addEventListener('mouseup', () => {
 // click = move the crosshair
 $('cv').addEventListener('click', e => {
   if (!meta || cropMode) return;
-  if (suppressClick) { suppressClick = false; return; }
+  if (suppressClick) { const recent = performance.now() - suppressClick < 400; suppressClick = 0; if (recent) return; }
   if (noteClick(e)) return;
+  if (activeNote || mkMenuFor) { activeNote = null; closeMkMenu(); }
   const p = radio('plane'), [x, y] = toNative(e), k = (meta.n - 1) - y;
   if (p === 'ax') { pos.c = x; pos.r = y; }
   else if (p === 'sag') { pos.r = x; pos.k = k; }
@@ -1266,7 +1567,7 @@ window.addEventListener('resize', () => draw());
 document.addEventListener('keydown', e => {
   if ((e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) && e.key === 'Escape') { e.target.blur(); return; }
   if (e.target.isContentEditable || e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'number'))) return;
-  if (e.key === 'Escape') { cancelNote(); return; }
+  if (e.key === 'Escape') { if (freeDraw) { endFreeDraw(); draw(); return; } if (mkMenuFor || activeNote) { closeMkMenu(); activeNote = null; draw(); return; } cancelNote(); return; }
   if (!meta) return;
   const k = e.key.toLowerCase(), ids = ['pri', ...loadedIds()];
   if (k === 't' && ids.length > 1) selectImage(ids[(ids.indexOf(current) + 1) % ids.length]);
@@ -1280,6 +1581,7 @@ $('cv').addEventListener('wheel', e => {
   syncSlider(); draw();
 }, {passive: false});
 </script>
+<script src="dose.js"></script>
 <script src="atlas.js"></script>
 <script src="import.js"></script>
 </body>
